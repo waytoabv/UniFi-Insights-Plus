@@ -163,6 +163,13 @@ the stored API keys cannot be decrypted and must be re-entered.
 
 - **Resources.** PostgreSQL, the receiver, and the API run concurrently; 4 cores and
   4 GB RAM are the realistic floor. The UI build alone peaks around 1 GB.
+- **The database must be UTF8.** A container image carries no UTF-8 locale, so
+  `postgresql-common` initialises the cluster as `SQL_ASCII`. The installer
+  therefore creates the database with an explicit encoding from `template0`.
+  A network named `Gäste` or a device with an accent would otherwise fail every
+  insert with *"Unicode escape value could not be translated"*, taking the whole
+  UniFi client sync down with it. Encoding cannot be changed after creation —
+  the installer reports a non-UTF8 database and prints the dump/reload steps.
 - **IPv6 must stay enabled** in the container. The receiver binds `('::', 514)` for
   dual-stack receive, so a container with `disable_ipv6=1` ingests nothing. The
   installer refuses to continue in that case.

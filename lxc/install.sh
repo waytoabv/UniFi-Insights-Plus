@@ -365,12 +365,34 @@ EOF
 
     db_exists=$(su - postgres -c "psql -tAc \"SELECT 1 FROM pg_database WHERE datname='${DB_NAME_LOCAL}'\"")
     if [ "$db_exists" != "1" ]; then
-        msg "Creating database '${DB_NAME_LOCAL}' and applying init.sql..."
-        su - postgres -c "psql -v ON_ERROR_STOP=1 -c \"CREATE DATABASE ${DB_NAME_LOCAL} OWNER ${DB_USER_LOCAL};\""
+        # Encoding must be stated explicitly. A container image carries no UTF-8
+        # locale, so postgresql-common initialises the cluster as SQL_ASCII and
+        # template1 inherits it. Any non-ASCII byte — a UniFi network named
+        # "Gäste", a device with an accent — then fails the insert outright with
+        # "Unicode escape value could not be translated". template0 is used
+        # because a database may only deviate from the template's encoding when
+        # copying from template0.
+        msg "Creating database '${DB_NAME_LOCAL}' (UTF8) and applying init.sql..."
+        su - postgres -c "psql -v ON_ERROR_STOP=1 -c \"CREATE DATABASE ${DB_NAME_LOCAL} OWNER ${DB_USER_LOCAL} ENCODING 'UTF8' LC_COLLATE 'C.UTF-8' LC_CTYPE 'C.UTF-8' TEMPLATE template0;\""
         su - postgres -c "psql -v ON_ERROR_STOP=1 -d ${DB_NAME_LOCAL} -f ${APP_DIR}/init.sql"
         ok "Database initialised."
     else
         ok "Database '${DB_NAME_LOCAL}' already exists — keeping its contents."
+    fi
+
+    # Encoding cannot be altered in place, so an existing non-UTF8 database can
+    # only be reported, not repaired.
+    DB_ENCODING=$(su - postgres -c "psql -tAc \"SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname='${DB_NAME_LOCAL}'\"")
+    if [ "$DB_ENCODING" != "UTF8" ]; then
+        warn "Database '${DB_NAME_LOCAL}' has encoding ${DB_ENCODING}, not UTF8."
+        warn "Non-ASCII names (VLANs, devices, hostnames) will fail to insert."
+        warn "Encoding is fixed at creation time. To convert, dump and reload:"
+        warn "    systemctl stop uip-api uip-receiver"
+        warn "    sudo -u postgres pg_dump -Fc ${DB_NAME_LOCAL} > /root/uip.dump"
+        warn "    sudo -u postgres dropdb ${DB_NAME_LOCAL}"
+        warn "    sudo -u postgres psql -c \"CREATE DATABASE ${DB_NAME_LOCAL} OWNER ${DB_USER_LOCAL} ENCODING 'UTF8' LC_COLLATE 'C.UTF-8' LC_CTYPE 'C.UTF-8' TEMPLATE template0;\""
+        warn "    sudo -u postgres pg_restore -d ${DB_NAME_LOCAL} /root/uip.dump"
+        warn "    then re-run this installer"
     fi
 
     # Privileges are re-applied on every run, not just on a fresh database.
