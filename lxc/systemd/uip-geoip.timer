@@ -1,0 +1,14 @@
+[Unit]
+Description=UniFi Insights Plus - GeoLite2 update schedule (Wed & Sat 07:00 UTC)
+Documentation=https://insightsplus.dev/docs
+
+[Timer]
+# Equivalent to the image's cron entry: 0 7 * * 3,6
+OnCalendar=Wed,Sat *-*-* 07:00:00 UTC
+# Catch up after the container was powered off at the scheduled time — cron would
+# simply have skipped the run.
+Persistent=true
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target

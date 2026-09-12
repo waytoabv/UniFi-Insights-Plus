@@ -1,0 +1,35 @@
+[Unit]
+Description=UniFi Insights Plus - API and dashboard
+Documentation=https://insightsplus.dev/docs
+After=network-online.target postgresql.service uip-receiver.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=uip
+Group=uip
+WorkingDirectory=/app
+EnvironmentFile=/etc/unifi-insights-plus.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/app/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# UVICORN_LOG_LEVEL is derived from LOG_LEVEL by uip-log-level.sh, the systemd
+# equivalent of the `tr '[:upper:]' '[:lower:]'` step in entrypoint.sh.
+ExecStart=/app/uip-api-start.sh
+
+Restart=always
+RestartSec=5
+StartLimitBurst=10
+StartLimitIntervalSec=300
+
+# See uip-receiver.service — /tmp is a shared IPC channel between the two units.
+PrivateTmp=false
+ProtectSystem=full
+ProtectHome=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=uip-api
+
+[Install]
+WantedBy=multi-user.target

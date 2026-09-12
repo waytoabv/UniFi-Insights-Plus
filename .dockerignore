@@ -7,3 +7,5 @@ __pycache__
 README.md
 ui/node_modules
 ui/dist
+lxc/
+docs/superpowers/

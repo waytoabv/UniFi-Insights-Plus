@@ -66,7 +66,7 @@
 
 ## 📋 Prerequisites
 
-- **Docker** and **Docker Compose**
+- **Docker** and **Docker Compose** — or, for a Docker-free install on Proxmox, see [Proxmox LXC](lxc/README.md)
 - **UniFi Router** (or any UniFi gateway that supports remote syslog)
 - **Zone-based firewall** (not legacy/classic). The Firewall Syslog Manager and firewall policy API require the zone-based policy engine. If you are still on the legacy/classic firewall, migrate via **Settings > Policy Engine** in your UniFi controller before setting up ULI.
 - **MaxMind GeoLite2 account** ([free signup](https://www.maxmind.com/en/geolite2/signup)) - for GeoIP/ASN lookups

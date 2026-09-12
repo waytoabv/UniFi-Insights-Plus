@@ -1,0 +1,17 @@
+[Unit]
+Description=UniFi Insights Plus - MaxMind GeoLite2 database update
+Documentation=https://insightsplus.dev/docs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/unifi-insights-plus.env
+
+# Runs as root: renders /etc/GeoIP.conf from the environment file, then hands off
+# to the upstream geoip-update.sh (which signals the receiver with SIGUSR1).
+ExecStart=/app/geoip-refresh.sh
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=uip-geoip

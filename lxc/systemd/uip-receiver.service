@@ -1,0 +1,41 @@
+[Unit]
+Description=UniFi Insights Plus - syslog receiver
+Documentation=https://insightsplus.dev/docs
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=uip
+Group=uip
+WorkingDirectory=/app
+EnvironmentFile=/etc/unifi-insights-plus.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/app/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/app/venv/bin/python /app/main.py
+
+# main.py binds ('::', 514) — dual-stack, privileged port, no root.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Mirrors supervisord: autorestart=true, startsecs=5, startretries=10
+Restart=always
+RestartSec=5
+StartLimitBurst=10
+StartLimitIntervalSec=300
+
+# Do NOT enable PrivateTmp: the API process hands config-reload requests to this
+# process through /tmp/config_update_requested (deps.py:157) and reads AbuseIPDB
+# counters from /tmp/abuseipdb_stats.json (enrichment.py:124). A private /tmp
+# breaks both silently.
+PrivateTmp=false
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/app/maxmind
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=uip-receiver
+
+[Install]
+WantedBy=multi-user.target
