@@ -282,6 +282,12 @@ API_PORT=8000
 
 # ── Optional integrations ──
 ABUSEIPDB_API_KEY=
+
+# GeoIP and ASN lookups. There are no fields for these in the UI — this file is
+# the only place they are read from. Account ID and license key come from
+# maxmind.com under My Account and Manage License Keys (not your password).
+# After filling them in, fetch the databases right away with:
+#     systemctl start uip-geoip.service
 MAXMIND_ACCOUNT_ID=
 MAXMIND_LICENSE_KEY=
 
