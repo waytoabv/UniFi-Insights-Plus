@@ -174,8 +174,12 @@ the stored API keys cannot be decrypted and must be re-entered.
 - **PostgreSQL tuning** lives in `/etc/postgresql/16/main/conf.d/10-unifi-insights.conf`
   so it survives package upgrades. Raise `shared_buffers` and `effective_cache_size`
   there if you give the container more RAM.
-- **Timezone.** Set `TZ` in the environment file to match your UniFi gateway, or
-  syslog timestamps will be offset.
+- **Timezone.** The installer inherits the Proxmox node's timezone and writes it
+  to `TZ`. What actually matters is your **UniFi gateway's** zone — syslog lines
+  carry a bare local time with no zone, so a mismatch shifts every timestamp by
+  the difference. Override with `--tz Europe/Berlin`, or edit `TZ` in the
+  environment file and restart. The daily retention cleanup time is interpreted
+  in this zone too.
 - **Backups.** Proxmox `vzdump` snapshots of the container cover the database too.
   Stop `uip-receiver` and `uip-api` first for a `stop`-mode backup, or rely on
   PostgreSQL crash recovery with `snapshot` mode.

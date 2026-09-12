@@ -6,7 +6,8 @@
 # of Dockerfile + entrypoint.sh + supervisord.conf.
 #
 #   ./lxc/install.sh [--source DIR] [--repo URL] [--ref REF]
-#                    [--keep-node] [--no-start] [--force-unsupported]
+#                    [--tz ZONE] [--keep-node] [--no-start]
+#                    [--force-unsupported]
 #
 # Re-running the script is safe: it upgrades an existing installation and never
 # touches an initialised database.
@@ -24,6 +25,7 @@ NODE_MAJOR=20
 KEEP_NODE=0
 START_SERVICES=1
 FORCE_UNSUPPORTED=0
+TZ_ARG=""
 SRC_REPO=""
 SRC_REF=""
 SOURCE_FILE=/etc/unifi-insights-plus.source
@@ -40,6 +42,7 @@ while [ $# -gt 0 ]; do
         --ref)       SRC_REF="$2"; shift 2 ;;
         --keep-node) KEEP_NODE=1; shift ;;
         --no-start)  START_SERVICES=0; shift ;;
+        --tz)        TZ_ARG="$2"; shift 2 ;;
         --force-unsupported) FORCE_UNSUPPORTED=1; shift ;;
         -h|--help)   sed -n '2,15p' "$0"; exit 0 ;;
         *)           die "Unknown argument: $1" ;;
@@ -230,8 +233,29 @@ fi
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
+# Syslog lines carry a bare local time with no zone, so the receiver has to
+# interpret them in the gateway's zone. Defaulting to UTC — the placeholder in
+# .env.example — silently shifts every timestamp for anyone not on UTC, so
+# inherit the host's zone where we can. proxmox-lxc.sh passes the PVE node's.
+if [ -z "$TZ_ARG" ]; then
+    if command -v timedatectl >/dev/null 2>&1; then
+        TZ_ARG=$(timedatectl show -p Timezone --value 2>/dev/null || true)
+    fi
+    [ -n "$TZ_ARG" ] || TZ_ARG=$(cat /etc/timezone 2>/dev/null || true)
+    [ -n "$TZ_ARG" ] || TZ_ARG=UTC
+fi
+if [ ! -f "/usr/share/zoneinfo/$TZ_ARG" ]; then
+    warn "Unknown timezone '$TZ_ARG'; falling back to UTC."
+    TZ_ARG=UTC
+fi
+
+# Keep the container clock aligned with it too, so journal timestamps and the
+# application's view of "now" agree.
+ln -sf "/usr/share/zoneinfo/$TZ_ARG" /etc/localtime
+echo "$TZ_ARG" > /etc/timezone
+
 if [ ! -f "$ENV_FILE" ]; then
-    msg "Generating $ENV_FILE..."
+    msg "Generating $ENV_FILE (timezone: $TZ_ARG)..."
     GENERATED_PASSWORD=$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)
     GENERATED_SECRET=$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)
     cat > "$ENV_FILE" <<EOF
@@ -247,8 +271,9 @@ POSTGRES_PASSWORD=${GENERATED_PASSWORD}
 # requires re-entering every API key in the UI.
 SECRET_KEY=${GENERATED_SECRET}
 
-# Must match your UniFi gateway's local time for correct syslog timestamps.
-TZ=UTC
+# Must match your UniFi gateway's local time: syslog lines carry a bare local
+# time with no zone, so a mismatch shifts every timestamp.
+TZ=${TZ_ARG}
 
 LOG_LEVEL=INFO
 

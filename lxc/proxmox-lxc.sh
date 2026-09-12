@@ -380,6 +380,11 @@ pct exec "$CTID" -- chmod +x "$CT_SRC/lxc/install.sh"
 # so without this the container cannot later work out what to update from — and on
 # a fork that matters, since upstream main carries no lxc/.
 INSTALL_ARGS=(--source "$CT_SRC")
+
+# Hand the node's timezone down. A fresh Ubuntu template is UTC, and syslog
+# timestamps would then be off by the node's offset.
+_host_tz=$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || true)
+[ -n "$_host_tz" ] && INSTALL_ARGS+=(--tz "$_host_tz")
 if [ -n "$GIT_REF" ]; then
     INSTALL_ARGS+=(--repo "$REPO_URL" --ref "$GIT_REF")
 elif [ -d "$SRC_DIR/.git" ]; then
