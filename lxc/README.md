@@ -12,11 +12,17 @@ cd UniFi-Insights-Plus
 ./lxc/proxmox-lxc.sh
 ```
 
-This picks the next free container ID, downloads the Ubuntu 24.04 template if
-needed, creates the container (4 cores, 4 GB RAM, 16 GB disk, DHCP), and runs the
-installer. It prints the dashboard URL when it finishes.
+A setup dialog opens. Pick **Defaults** to answer only the two questions that
+depend on your host — which storage the container's disk goes on, and whether it
+gets a static address — or **Advanced** to set container ID, hostname, cores,
+memory, swap, disk size, and bridge yourself. A summary appears before anything
+is created.
 
-Common options:
+The script then downloads the Ubuntu 24.04 template if needed, creates the
+container, and runs the installer. It prints the dashboard URL when it finishes.
+
+To skip the dialog entirely, pass `--defaults`, or give the values as options —
+anything supplied on the command line is used as-is:
 
 ```bash
 ./lxc/proxmox-lxc.sh \
@@ -27,7 +33,12 @@ Common options:
   --memory 8192 --disk 32
 ```
 
-`./lxc/proxmox-lxc.sh --help` lists all of them.
+`./lxc/proxmox-lxc.sh --help` lists all of them. Note that `--ip` takes CIDR
+notation — `192.168.1.50` alone is rejected, `192.168.1.50/24` is what `pct`
+expects.
+
+A static address is worth setting: the UniFi gateway sends syslog to a fixed
+address, and a DHCP lease can move the container out from under it.
 
 To provision from GitHub rather than a local checkout — useful when running the
 script straight off a Proxmox shell:
