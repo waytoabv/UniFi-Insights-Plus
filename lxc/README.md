@@ -100,12 +100,29 @@ systemctl start uip-geoip.service     # force a GeoLite2 update now
 
 ## Updating
 
+From the Proxmox host, deploying the checkout you already have:
+
+```bash
+cd /opt/UniFi-Insights-Plus && ./lxc/proxmox-update.sh <ctid>
+```
+
+This pulls the host checkout, pushes it into the container, and re-runs the
+installer. Nothing is needed inside the container — useful because
+`proxmox-lxc.sh` delivers a tarball, so `/opt/uip-src` is not a git checkout and
+`git pull` there does not work.
+
+From inside the container instead:
+
 ```bash
 /opt/uip-src/lxc/update.sh --ref v3.7.0
 ```
 
-Or track a branch with `--ref main`. The configuration file and the database are
-preserved; the application migrates its own schema on start.
+It fetches from whichever repository the container was installed from, recorded
+in `/etc/unifi-insights-plus.source`, installing git first if needed. Override
+with `--repo URL --ref BRANCH`.
+
+Either way the configuration file and the database are preserved; the
+application migrates its own schema on start.
 
 ## External PostgreSQL
 

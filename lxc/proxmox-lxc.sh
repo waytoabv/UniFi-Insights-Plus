@@ -375,7 +375,19 @@ ok "Source delivered to $CT_SRC."
 
 msg "Running the installer inside the container (several minutes: apt, pip, UI build)..."
 pct exec "$CTID" -- chmod +x "$CT_SRC/lxc/install.sh"
-pct exec "$CTID" -- "$CT_SRC/lxc/install.sh" --source "$CT_SRC"
+
+# Tell the container which repository it came from. The tarball path strips .git,
+# so without this the container cannot later work out what to update from — and on
+# a fork that matters, since upstream main carries no lxc/.
+INSTALL_ARGS=(--source "$CT_SRC")
+if [ -n "$GIT_REF" ]; then
+    INSTALL_ARGS+=(--repo "$REPO_URL" --ref "$GIT_REF")
+elif [ -d "$SRC_DIR/.git" ]; then
+    _origin=$(git -C "$SRC_DIR" remote get-url origin 2>/dev/null || true)
+    _ref=$(git -C "$SRC_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+    [ -n "$_origin" ] && INSTALL_ARGS+=(--repo "$_origin" --ref "${_ref:-main}")
+fi
+pct exec "$CTID" -- "$CT_SRC/lxc/install.sh" "${INSTALL_ARGS[@]}"
 
 trap - EXIT
 

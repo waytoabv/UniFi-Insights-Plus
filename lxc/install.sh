@@ -5,7 +5,8 @@
 # Run this INSIDE an Ubuntu 24.04 container as root. It is the systemd equivalent
 # of Dockerfile + entrypoint.sh + supervisord.conf.
 #
-#   ./lxc/install.sh [--source DIR] [--keep-node] [--no-start]
+#   ./lxc/install.sh [--source DIR] [--repo URL] [--ref REF]
+#                    [--keep-node] [--no-start]
 #
 # Re-running the script is safe: it upgrades an existing installation and never
 # touches an initialised database.
@@ -22,6 +23,9 @@ GEOIPUPDATE_VERSION=7.1.1
 NODE_MAJOR=20
 KEEP_NODE=0
 START_SERVICES=1
+SRC_REPO=""
+SRC_REF=""
+SOURCE_FILE=/etc/unifi-insights-plus.source
 
 msg()  { echo -e "\033[1;34m[install]\033[0m $*"; }
 ok()   { echo -e "\033[1;32m[  ok  ]\033[0m $*"; }
@@ -31,9 +35,11 @@ die()  { echo -e "\033[1;31m[fatal ]\033[0m $*" >&2; exit 1; }
 while [ $# -gt 0 ]; do
     case "$1" in
         --source)    SRC_DIR="$2"; shift 2 ;;
+        --repo)      SRC_REPO="$2"; shift 2 ;;
+        --ref)       SRC_REF="$2"; shift 2 ;;
         --keep-node) KEEP_NODE=1; shift ;;
         --no-start)  START_SERVICES=0; shift ;;
-        -h|--help)   sed -n '2,14p' "$0"; exit 0 ;;
+        -h|--help)   sed -n '2,15p' "$0"; exit 0 ;;
         *)           die "Unknown argument: $1" ;;
     esac
 done
@@ -127,6 +133,18 @@ install -m 0755 "$SRC_DIR/lxc/geoip-refresh.sh" "$APP_DIR/geoip-refresh.sh"
 install -m 0755 "$SRC_DIR/lxc/uip-api-start.sh" "$APP_DIR/uip-api-start.sh"
 ok "Application files deployed ($(cat "$APP_DIR/VERSION"))."
 
+# Record the origin of this install. proxmox-lxc.sh delivers a tarball without
+# .git, so the container cannot work out on its own which repository to update
+# from — and on a fork that matters, since upstream main carries no lxc/.
+if [ -z "$SRC_REPO" ] && [ -d "$SRC_DIR/.git" ]; then
+    SRC_REPO=$(git -C "$SRC_DIR" remote get-url origin 2>/dev/null || true)
+    SRC_REF=${SRC_REF:-$(git -C "$SRC_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || true)}
+fi
+if [ -n "$SRC_REPO" ]; then
+    printf 'UIP_REPO=%s\nUIP_REF=%s\n' "$SRC_REPO" "${SRC_REF:-main}" > "$SOURCE_FILE"
+    chmod 0644 "$SOURCE_FILE"
+fi
+
 # ── Python virtualenv ────────────────────────────────────────────────────────
 
 if [ ! -x "$APP_DIR/venv/bin/python" ]; then
@@ -177,8 +195,8 @@ if [ "$NODE_INSTALLED_HERE" = "1" ] && [ "$KEEP_NODE" = "0" ]; then
     apt-get remove -y -qq nodejs >/dev/null
     apt-get autoremove -y -qq >/dev/null
     rm -f /etc/apt/sources.list.d/nodesource.list
+    apt-get update -qq
 fi
-rm -rf /var/lib/apt/lists/*
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
