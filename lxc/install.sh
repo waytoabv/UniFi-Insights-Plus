@@ -6,7 +6,7 @@
 # of Dockerfile + entrypoint.sh + supervisord.conf.
 #
 #   ./lxc/install.sh [--source DIR] [--repo URL] [--ref REF]
-#                    [--keep-node] [--no-start]
+#                    [--keep-node] [--no-start] [--force-unsupported]
 #
 # Re-running the script is safe: it upgrades an existing installation and never
 # touches an initialised database.
@@ -23,6 +23,7 @@ GEOIPUPDATE_VERSION=7.1.1
 NODE_MAJOR=20
 KEEP_NODE=0
 START_SERVICES=1
+FORCE_UNSUPPORTED=0
 SRC_REPO=""
 SRC_REF=""
 SOURCE_FILE=/etc/unifi-insights-plus.source
@@ -39,6 +40,7 @@ while [ $# -gt 0 ]; do
         --ref)       SRC_REF="$2"; shift 2 ;;
         --keep-node) KEEP_NODE=1; shift ;;
         --no-start)  START_SERVICES=0; shift ;;
+        --force-unsupported) FORCE_UNSUPPORTED=1; shift ;;
         -h|--help)   sed -n '2,15p' "$0"; exit 0 ;;
         *)           die "Unknown argument: $1" ;;
     esac
@@ -58,11 +60,39 @@ for f in receiver/main.py receiver/requirements.txt init.sql VERSION ui/package.
     [ -e "$SRC_DIR/$f" ] || die "Source tree incomplete: $SRC_DIR/$f not found. Pass --source /path/to/repo."
 done
 
+# This installer belongs INSIDE a container. On a Proxmox VE node it would write
+# PostgreSQL, a virtualenv, Node and systemd units onto the hypervisor itself.
+if [ "$FORCE_UNSUPPORTED" = "0" ] && { [ -d /etc/pve ] || command -v pveversion >/dev/null 2>&1; }; then
+    echo >&2
+    die "This looks like a Proxmox VE host, not a container.
+
+  install.sh runs INSIDE the container. To create one and install into it:
+
+      ./lxc/proxmox-lxc.sh
+
+  To update a container that already exists:
+
+      ./lxc/proxmox-update.sh <ctid>
+
+  If you really mean to install onto this machine, pass --force-unsupported."
+fi
+
 if [ -r /etc/os-release ]; then
     . /etc/os-release
     if [ "${ID:-}" != "ubuntu" ] || [ "${VERSION_ID:-}" != "24.04" ]; then
-        warn "Expected Ubuntu 24.04 (postgresql-${PG_VERSION} in the archive); found ${PRETTY_NAME:-unknown}."
-        warn "Continuing — install postgresql-${PG_VERSION} yourself if apt cannot find it."
+        if [ "$FORCE_UNSUPPORTED" = "1" ]; then
+            warn "Expected Ubuntu 24.04; found ${PRETTY_NAME:-unknown}. Continuing because --force-unsupported was given."
+            warn "apt must be able to resolve postgresql-${PG_VERSION}, or this will fail."
+        else
+            die "Expected Ubuntu 24.04, found ${PRETTY_NAME:-unknown}.
+
+  postgresql-${PG_VERSION} is in the Ubuntu 24.04 archive, matching the Docker
+  image. Debian 13 ships PostgreSQL 17 and Debian 12 ships 15, so apt here
+  cannot resolve the package this installer asks for.
+
+  Create an Ubuntu 24.04 container, or pass --force-unsupported if you have
+  arranged for postgresql-${PG_VERSION} to be installable (PGDG, for example)."
+        fi
     fi
 fi
 

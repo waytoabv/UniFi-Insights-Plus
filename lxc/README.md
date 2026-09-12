@@ -60,6 +60,12 @@ git clone https://github.com/jmasarweh/UniFi-Insights-Plus.git /opt/uip-src
 
 The installer also works on a plain Ubuntu 24.04 VM or bare-metal host.
 
+It refuses to run on a Proxmox VE node — `install.sh` installs into the machine
+it runs on, and on a hypervisor that is the hypervisor. Use `proxmox-lxc.sh`
+there instead. It also requires Ubuntu 24.04, because that is where
+`postgresql-16` lives; Debian 12 ships 15 and Debian 13 ships 17. Both checks
+can be overridden with `--force-unsupported` if you know what you are arranging.
+
 ## After installation
 
 1. Open `http://<container-ip>:8000` and complete the setup wizard.
