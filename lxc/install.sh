@@ -295,19 +295,55 @@ EOF
         msg "Creating database '${DB_NAME_LOCAL}' and applying init.sql..."
         su - postgres -c "psql -v ON_ERROR_STOP=1 -c \"CREATE DATABASE ${DB_NAME_LOCAL} OWNER ${DB_USER_LOCAL};\""
         su - postgres -c "psql -v ON_ERROR_STOP=1 -d ${DB_NAME_LOCAL} -f ${APP_DIR}/init.sql"
-        su - postgres -c "psql -d ${DB_NAME_LOCAL} -c \"GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO ${DB_USER_LOCAL};\""
-        su - postgres -c "psql -d ${DB_NAME_LOCAL} -c \"GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO ${DB_USER_LOCAL};\""
-
-        # Without these the app cannot run its own ALTER TABLE migrations.
-        su - postgres -c "psql -d ${DB_NAME_LOCAL} -c \"ALTER TABLE logs OWNER TO ${DB_USER_LOCAL};\""
-        su - postgres -c "psql -d ${DB_NAME_LOCAL} -c \"ALTER TABLE ip_threats OWNER TO ${DB_USER_LOCAL};\""
-        su - postgres -c "psql -d ${DB_NAME_LOCAL} -c \"ALTER SEQUENCE logs_id_seq OWNER TO ${DB_USER_LOCAL};\""
-        for t in system_config unifi_clients unifi_devices; do
-            su - postgres -c "psql -d ${DB_NAME_LOCAL} -c \"DO \\\$\\\$ BEGIN IF EXISTS (SELECT 1 FROM pg_tables WHERE tablename='${t}') THEN ALTER TABLE ${t} OWNER TO ${DB_USER_LOCAL}; END IF; END \\\$\\\$;\""
-        done
         ok "Database initialised."
     else
-        ok "Database '${DB_NAME_LOCAL}' already exists — leaving it untouched."
+        ok "Database '${DB_NAME_LOCAL}' already exists — keeping its contents."
+    fi
+
+    # Privileges are re-applied on every run, not just on a fresh database.
+    #
+    # init.sql runs as the postgres superuser, so every object it creates is owned
+    # by postgres. The application then issues its own ALTER TABLE / CREATE INDEX
+    # migrations as the app role, which PostgreSQL refuses for objects it does not
+    # own — the API logs these as "Migration skipped (insufficient privilege)".
+    # entrypoint.sh hands over a hardcoded list of five tables and misses the rest
+    # (sessions, api_tokens, audit_log, users, roles, threat_backfill_queue), so
+    # the whole public schema is transferred here instead. Running this every time
+    # also repairs installations made before this block existed, and covers tables
+    # that a later release adds to init.sql.
+    msg "Applying privileges and object ownership to '${DB_USER_LOCAL}'..."
+    GRANTS_SQL=$(mktemp /tmp/uip-grants-XXXXXX.sql)
+    chmod 0644 "$GRANTS_SQL"
+    cat > "$GRANTS_SQL" <<EOF
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO ${DB_USER_LOCAL};
+GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO ${DB_USER_LOCAL};
+GRANT CREATE, USAGE ON SCHEMA public TO ${DB_USER_LOCAL};
+
+DO \$\$
+DECLARE
+    obj record;
+BEGIN
+    FOR obj IN SELECT tablename AS name FROM pg_tables WHERE schemaname = 'public' LOOP
+        EXECUTE format('ALTER TABLE public.%I OWNER TO %I', obj.name, '${DB_USER_LOCAL}');
+    END LOOP;
+    FOR obj IN SELECT sequencename AS name FROM pg_sequences WHERE schemaname = 'public' LOOP
+        EXECUTE format('ALTER SEQUENCE public.%I OWNER TO %I', obj.name, '${DB_USER_LOCAL}');
+    END LOOP;
+    FOR obj IN SELECT viewname AS name FROM pg_views WHERE schemaname = 'public' LOOP
+        EXECUTE format('ALTER VIEW public.%I OWNER TO %I', obj.name, '${DB_USER_LOCAL}');
+    END LOOP;
+END
+\$\$;
+EOF
+    su - postgres -c "psql -v ON_ERROR_STOP=1 -d ${DB_NAME_LOCAL} -f $GRANTS_SQL" >/dev/null
+    rm -f "$GRANTS_SQL"
+    ok "Privileges applied."
+
+    # routes/health.py reads disk usage from the image's PGDATA path. The
+    # distribution cluster lives elsewhere, so point the old path at it rather
+    # than patch the application.
+    if [ ! -e /var/lib/postgresql/data ]; then
+        ln -s "/var/lib/postgresql/${PG_VERSION}/main" /var/lib/postgresql/data
     fi
 fi
 

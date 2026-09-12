@@ -156,3 +156,9 @@ the stored API keys cannot be decrypted and must be re-entered.
 - **Backups.** Proxmox `vzdump` snapshots of the container cover the database too.
   Stop `uip-receiver` and `uip-api` first for a `stop`-mode backup, or rely on
   PostgreSQL crash recovery with `snapshot` mode.
+- **The dashboard is on port 8000, not 8090.** The published `docker-compose.yml`
+  maps `8090:8000`; there is no port mapping here, so the container's own port is
+  what you open.
+- **`Migration skipped (insufficient privilege)` in the API log** means the app
+  role does not own the tables it is migrating. Re-run `lxc/install.sh` — it
+  transfers ownership of the whole `public` schema on every run.
