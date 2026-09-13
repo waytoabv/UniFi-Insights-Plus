@@ -7,17 +7,35 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import lookups
 from fastapi import APIRouter, Query, HTTPException
 from fastapi.responses import StreamingResponse
 from psycopg2.extras import RealDictCursor
 
 from db import get_config, get_wan_ips_from_config
 from deps import get_conn, put_conn, enricher_db
+from parallel import run_queries
+from services import get_service_name
 from ip_identity import load_identity_config, annotate_record, annotate_ip
 from query_helpers import (parse_time_range, build_log_query, validate_time_params,
                           VALID_TIME_RANGES, device_name_client_lateral,
                           device_name_device_lateral, device_name_coalesce,
                           sanitize_csv_cell)
+
+# Closed-set ids inlined into the aggregate SQL below.
+#
+# These filter on the base table's id columns rather than the view's text ones.
+# A text comparison would have to resolve the lookup first, which puts
+# idx_logs_action_time and idx_logs_type_time out of reach — the difference
+# between an index scan and reading every row in the window.
+_RA_ALLOW = lookups.rule_action_id('allow')
+_RA_BLOCK = lookups.rule_action_id('block')
+_RA_REDIRECT = lookups.rule_action_id('redirect')
+_LT_FIREWALL = lookups.log_type_id('firewall')
+_LT_DNS = lookups.log_type_id('dns')
+_DIR_INBOUND = lookups.direction_id('inbound')
+_DIR_OUTBOUND = lookups.direction_id('outbound')
+
 
 logger = logging.getLogger('api.stats')
 
@@ -77,8 +95,8 @@ def _query_top_blocked_ips(cur, cutoff, exclude_ips):
         "SELECT host(src_ip) as ip, COUNT(*) as count, "
         "MAX(geo_country) as country, MAX(asn_name) as asn, "
         "MAX(threat_score) as threat_score "
-        "FROM logs_text "
-        "WHERE timestamp >= %s AND rule_action = 'block' AND src_ip IS NOT NULL "
+        "FROM logs "
+        f"WHERE timestamp >= %s AND rule_action_id = {_RA_BLOCK} AND src_ip IS NOT NULL "
         "AND host(src_ip) != ALL(%s) "
         "AND is_public_inet(src_ip) "
         "GROUP BY src_ip ORDER BY count DESC LIMIT 10",
@@ -92,8 +110,8 @@ def _query_top_blocked_internal_ips(cur, cutoff):
     cur.execute(
         "WITH top_ips AS ("
         "  SELECT src_ip, host(src_ip) as ip, COUNT(*) as count "
-        "  FROM logs_text "
-        "  WHERE timestamp >= %s AND rule_action = 'block' AND src_ip IS NOT NULL "
+        "  FROM logs "
+        f"  WHERE timestamp >= %s AND rule_action_id = {_RA_BLOCK} AND src_ip IS NOT NULL "
         "  AND NOT is_public_inet(src_ip) "
         "  GROUP BY src_ip ORDER BY count DESC LIMIT 10"
         ") SELECT t.ip, t.count, "
@@ -115,7 +133,7 @@ def _query_top_threat_ips(cur, cutoff, exclude_ips):
         "MAX(l.threat_score) as threat_score, "
         "COALESCE(MAX(l.threat_categories), MAX(t.threat_categories)) as threat_categories, "
         "MAX(l.timestamp) as last_seen "
-        "FROM logs_text l "
+        "FROM logs l "
         "LEFT JOIN ip_threats t ON l.src_ip = t.ip "
         "WHERE l.timestamp >= %s AND l.threat_score > 50 AND l.src_ip IS NOT NULL "
         "AND host(l.src_ip) != ALL(%s) "
@@ -136,8 +154,8 @@ def _query_top_allowed_destinations(cur, cutoff, exclude_ips):
     cur.execute(
         "SELECT host(dst_ip) as ip, COUNT(*) as count, "
         "MAX(geo_country) as country, MAX(asn_name) as asn "
-        "FROM logs_text "
-        "WHERE timestamp >= %s AND rule_action = 'allow' AND dst_ip IS NOT NULL "
+        "FROM logs "
+        f"WHERE timestamp >= %s AND rule_action_id = {_RA_ALLOW} AND dst_ip IS NOT NULL "
         "AND host(dst_ip) != ALL(%s) "
         "AND is_public_inet(dst_ip) "
         "GROUP BY dst_ip ORDER BY count DESC LIMIT 10",
@@ -149,8 +167,8 @@ def _query_top_allowed_destinations(cur, cutoff, exclude_ips):
 def _query_top_dns(cur, cutoff):
     """Top DNS queries."""
     cur.execute(
-        "SELECT dns_query, COUNT(*) as count FROM logs_text "
-        "WHERE timestamp >= %s AND log_type = 'dns' AND dns_query IS NOT NULL "
+        "SELECT dns_query, COUNT(*) as count FROM logs "
+        f"WHERE timestamp >= %s AND log_type_id = {_LT_DNS} AND dns_query IS NOT NULL "
         "GROUP BY dns_query ORDER BY count DESC LIMIT 10",
         [cutoff]
     )
@@ -165,8 +183,8 @@ def _query_top_active_internal_ips(cur, cutoff):
     cur.execute(
         "WITH top_ips AS ("
         "  SELECT src_ip, host(src_ip) as ip, COUNT(*) as count "
-        "  FROM logs_text "
-        "  WHERE timestamp >= %s AND rule_action = 'allow' AND src_ip IS NOT NULL "
+        "  FROM logs "
+        f"  WHERE timestamp >= %s AND rule_action_id = {_RA_ALLOW} AND src_ip IS NOT NULL "
         "  AND NOT is_public_inet(src_ip) "
         + gw_filter +
         "  GROUP BY src_ip ORDER BY count DESC LIMIT 10"
@@ -195,7 +213,7 @@ def _query_logs_over_time(cur, cutoff, bucket):
     """Logs over time with adaptive bucketing."""
     cur.execute(
         f"SELECT date_trunc('{bucket}', timestamp) as period, COUNT(*) as count "
-        "FROM logs_text WHERE timestamp >= %s "
+        "FROM logs WHERE timestamp >= %s "
         "GROUP BY period ORDER BY period",
         [cutoff]
     )
@@ -206,23 +224,27 @@ def _query_logs_over_time(cur, cutoff, bucket):
 
 
 def _query_traffic_by_action(cur, cutoff, bucket):
-    """Traffic by action over time (firewall logs only)."""
+    """Traffic by action over time (firewall logs only).
+
+    Grouped on rule_action_id and named afterwards: three actions across a few
+    dozen buckets, rather than a join against every row in the window.
+    """
     cur.execute(
         f"SELECT date_trunc('{bucket}', timestamp) as period, "
-        "rule_action, COUNT(*) as count "
-        "FROM logs_text WHERE timestamp >= %s AND log_type = 'firewall' "
-        "AND rule_action IS NOT NULL "
-        "GROUP BY period, rule_action ORDER BY period",
+        f"rule_action_id, COUNT(*) as count "
+        f"FROM logs WHERE timestamp >= %s AND log_type_id = {_LT_FIREWALL} "
+        f"AND rule_action_id IS NOT NULL "
+        f"GROUP BY period, rule_action_id ORDER BY period",
         [cutoff]
     )
     action_map = {}
     for r in cur.fetchall():
-        p = r['period'].isoformat()
-        if p not in action_map:
-            action_map[p] = {'period': p, 'allow': 0, 'block': 0, 'redirect': 0}
-        action = r['rule_action']
+        period = r['period'].isoformat()
+        if period not in action_map:
+            action_map[period] = {'period': period, 'allow': 0, 'block': 0, 'redirect': 0}
+        action = lookups.rule_action_text(r['rule_action_id'])
         if action in ('allow', 'block', 'redirect'):
-            action_map[p][action] = r['count']
+            action_map[period][action] = r['count']
     return sorted(action_map.values(), key=lambda x: x['period'])
 
 
@@ -258,7 +280,7 @@ def get_stats(
             # Blocked count
             cur.execute(
                 "SELECT COUNT(*) as count FROM logs_text "
-                "WHERE timestamp >= %s AND rule_action = 'block'",
+                f"WHERE timestamp >= %s AND rule_action_id = {_RA_BLOCK}",
                 [cutoff]
             )
             blocked = cur.fetchone()['count']
@@ -274,7 +296,7 @@ def get_stats(
             # Top blocked countries
             cur.execute(
                 "SELECT geo_country as country, COUNT(*) as count FROM logs_text "
-                "WHERE timestamp >= %s AND rule_action = 'block' AND geo_country IS NOT NULL "
+                f"WHERE timestamp >= %s AND rule_action_id = {_RA_BLOCK} AND geo_country IS NOT NULL "
                 "GROUP BY geo_country ORDER BY count DESC LIMIT 10",
                 [cutoff]
             )
@@ -302,7 +324,7 @@ def get_stats(
             # Top blocked services
             cur.execute(
                 "SELECT service_name, COUNT(*) as count FROM logs_text "
-                "WHERE timestamp >= %s AND rule_action = 'block' AND service_name IS NOT NULL "
+                f"WHERE timestamp >= %s AND rule_action_id = {_RA_BLOCK} AND service_name IS NOT NULL "
                 "GROUP BY service_name ORDER BY count DESC LIMIT 10",
                 [cutoff]
             )
@@ -311,7 +333,7 @@ def get_stats(
             # Allowed count
             cur.execute(
                 "SELECT COUNT(*) as count FROM logs_text "
-                "WHERE timestamp >= %s AND log_type = 'firewall' AND rule_action = 'allow'",
+                f"WHERE timestamp >= %s AND log_type_id = {_LT_FIREWALL} AND rule_action_id = {_RA_ALLOW}",
                 [cutoff]
             )
             allowed = cur.fetchone()['count']
@@ -321,8 +343,8 @@ def get_stats(
             # Top allowed countries (outbound destinations)
             cur.execute(
                 "SELECT geo_country as country, COUNT(*) as count FROM logs_text "
-                "WHERE timestamp >= %s AND rule_action = 'allow' "
-                "AND geo_country IS NOT NULL AND direction = 'outbound' "
+                f"WHERE timestamp >= %s AND rule_action_id = {_RA_ALLOW} "
+                f"AND geo_country IS NOT NULL AND direction_id = {_DIR_OUTBOUND} "
                 "GROUP BY geo_country ORDER BY count DESC LIMIT 10",
                 [cutoff]
             )
@@ -331,7 +353,7 @@ def get_stats(
             # Top allowed services
             cur.execute(
                 "SELECT service_name, COUNT(*) as count FROM logs_text "
-                "WHERE timestamp >= %s AND rule_action = 'allow' AND service_name IS NOT NULL "
+                f"WHERE timestamp >= %s AND rule_action_id = {_RA_ALLOW} AND service_name IS NOT NULL "
                 "GROUP BY service_name ORDER BY count DESC LIMIT 10",
                 [cutoff]
             )
@@ -384,135 +406,176 @@ def get_stats_overview(
     if not cutoff:
         cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
 
-    conn = get_conn()
+    # All three read the base table and group on ids: none of them displays a
+    # lookup value, so going through the view would add eleven joins per row
+    # for nothing. The names are attached afterwards, over a handful of groups.
+    def counts(cur):
+        cur.execute(f"""
+            SELECT
+                COUNT(*) AS total,
+                COUNT(*) FILTER (WHERE log_type_id = {_LT_FIREWALL}
+                                   AND rule_action_id = {_RA_ALLOW}) AS allowed,
+                COUNT(*) FILTER (WHERE rule_action_id = {_RA_BLOCK}) AS blocked,
+                COUNT(*) FILTER (WHERE threat_score > 50) AS threats
+            FROM logs WHERE timestamp >= %s
+        """, [cutoff])
+        return cur.fetchone()
+
+    def by_direction(cur):
+        cur.execute("""
+            SELECT direction_id, COUNT(*) AS count FROM logs
+            WHERE timestamp >= %s AND direction_id IS NOT NULL
+            GROUP BY direction_id ORDER BY count DESC
+        """, [cutoff])
+        return {lookups.direction_text(r['direction_id']): r['count']
+                for r in cur.fetchall()
+                if lookups.direction_text(r['direction_id'])}
+
+    def by_type(cur):
+        cur.execute("""
+            SELECT log_type_id, COUNT(*) AS count FROM logs
+            WHERE timestamp >= %s GROUP BY log_type_id ORDER BY count DESC
+        """, [cutoff])
+        return {lookups.log_type_text(r['log_type_id']): r['count']
+                for r in cur.fetchall()
+                if lookups.log_type_text(r['log_type_id'])}
+
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT
-                    COUNT(*) AS total,
-                    COUNT(*) FILTER (WHERE log_type = 'firewall' AND rule_action = 'allow') AS allowed,
-                    COUNT(*) FILTER (WHERE rule_action = 'block') AS blocked,
-                    COUNT(*) FILTER (WHERE threat_score > 50) AS threats
-                FROM logs_text WHERE timestamp >= %s
-            """, [cutoff])
-            row = cur.fetchone()
-
-            cur.execute("""
-                SELECT direction, COUNT(*) AS count
-                FROM logs_text
-                WHERE timestamp >= %s AND direction IS NOT NULL
-                GROUP BY direction ORDER BY count DESC
-            """, [cutoff])
-            by_direction = {r['direction']: r['count'] for r in cur.fetchall()}
-
-            cur.execute("""
-                SELECT log_type, COUNT(*) AS count
-                FROM logs_text
-                WHERE timestamp >= %s
-                GROUP BY log_type ORDER BY count DESC
-            """, [cutoff])
-            by_type = {r['log_type']: r['count'] for r in cur.fetchall()}
-
-        conn.commit()
-        return {
-            'time_range': time_range,
-            'total': row['total'],
-            'allowed': row['allowed'],
-            'blocked': row['blocked'],
-            'threats': row['threats'],
-            'by_direction': by_direction,
-            'by_type': by_type,
-        }
+        results = run_queries(
+            {'counts': counts, 'direction': by_direction, 'type': by_type},
+            connect=get_conn, release=put_conn,
+            # Zeros here would read as "no traffic" rather than "could not load".
+            required=('counts', 'direction', 'type'))
     except Exception as e:
-        conn.rollback()
         logger.exception("Error fetching stats overview")
         raise HTTPException(status_code=500, detail="Internal server error") from e
-    finally:
-        put_conn(conn)
+
+    row = results.get('counts') or {'total': 0, 'allowed': 0, 'blocked': 0, 'threats': 0}
+    by_direction = results.get('direction') or {}
+    by_type = results.get('type') or {}
+
+    return {
+        'time_range': time_range,
+        'total': row['total'],
+        'allowed': row['allowed'],
+        'blocked': row['blocked'],
+        'threats': row['threats'],
+        'by_direction': by_direction,
+        'by_type': by_type,
+    }
 
 
 @router.get("/api/stats/tables")
 def get_stats_tables(
     time_range: str = Query("24h", description="1h,6h,24h,7d,30d,60d"),
 ):
-    """Top-N table data: blocked/allowed countries, IPs, services, DNS, threats."""
+    """Top-N table data: blocked/allowed countries, IPs, services, DNS, threats.
+
+    The ten aggregates below share only a time window, so they run concurrently
+    rather than one after another — sequentially their latency was their sum,
+    measured at 12.5 s on a live install.
+    """
     cutoff = parse_time_range(time_range)
     if not cutoff:
         cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
 
-    conn = get_conn()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # --- WAN IP exclusion (shared across multiple queries) ---
-            exclude_ips = _build_exclude_ips()
+    exclude_ips = _build_exclude_ips()
 
-            # --- Consolidated countries query (blocked + allowed) ---
-            cur.execute(
-                "SELECT geo_country AS country, rule_action, COUNT(*) AS count FROM logs_text "
-                "WHERE timestamp >= %s AND rule_action IN ('block', 'allow') "
-                "AND geo_country IS NOT NULL "
-                "AND (rule_action = 'block' OR direction = 'outbound') "
-                "GROUP BY geo_country, rule_action ORDER BY count DESC",
-                [cutoff]
-            )
-            blocked_countries_map = {}
-            allowed_countries_map = {}
-            for r in cur.fetchall():
-                entry = {'country': r['country'], 'count': r['count']}
-                if r['rule_action'] == 'block':
-                    blocked_countries_map[r['country']] = entry
-                else:
-                    allowed_countries_map[r['country']] = entry
-            top_blocked_countries = sorted(blocked_countries_map.values(), key=lambda x: -x['count'])[:10]
-            top_allowed_countries = sorted(allowed_countries_map.values(), key=lambda x: -x['count'])[:10]
+    results = run_queries({
+        'countries': lambda cur: _query_top_countries(cur, cutoff),
+        'services': lambda cur: _query_top_services(cur, cutoff),
+        'blocked_ips': lambda cur: _query_top_blocked_ips(cur, cutoff, exclude_ips),
+        'blocked_internal': lambda cur: _query_top_blocked_internal_ips(cur, cutoff),
+        'threat_ips': lambda cur: _query_top_threat_ips(cur, cutoff, exclude_ips),
+        'allowed_destinations': lambda cur: _query_top_allowed_destinations(cur, cutoff, exclude_ips),
+        'dns': lambda cur: _query_top_dns(cur, cutoff),
+        'active_internal': lambda cur: _query_top_active_internal_ips(cur, cutoff),
+    }, connect=get_conn, release=put_conn)
 
-            # --- Consolidated services query (blocked + allowed) ---
-            cur.execute(
-                "SELECT service_name, rule_action, COUNT(*) AS count FROM logs_text "
-                "WHERE timestamp >= %s AND rule_action IN ('block', 'allow') "
-                "AND service_name IS NOT NULL "
-                "GROUP BY service_name, rule_action ORDER BY count DESC",
-                [cutoff]
-            )
-            blocked_services_map = {}
-            allowed_services_map = {}
-            for r in cur.fetchall():
-                entry = {'service_name': r['service_name'], 'count': r['count']}
-                if r['rule_action'] == 'block':
-                    blocked_services_map[r['service_name']] = entry
-                else:
-                    allowed_services_map[r['service_name']] = entry
-            top_blocked_services = sorted(blocked_services_map.values(), key=lambda x: -x['count'])[:10]
-            top_allowed_services = sorted(allowed_services_map.values(), key=lambda x: -x['count'])[:10]
+    countries = results.get('countries') or {}
+    services = results.get('services') or {}
+    blocked_internal = results.get('blocked_internal') or []
+    active_internal = results.get('active_internal') or []
 
-            top_blocked_ips = _query_top_blocked_ips(cur, cutoff, exclude_ips)
-            top_blocked_internal_ips = _query_top_blocked_internal_ips(cur, cutoff)
-            top_threat_ips = _query_top_threat_ips(cur, cutoff, exclude_ips)
-            top_allowed_destinations = _query_top_allowed_destinations(cur, cutoff, exclude_ips)
-            top_dns = _query_top_dns(cur, cutoff)
-            top_active_internal_ips = _query_top_active_internal_ips(cur, cutoff)
+    # Runs after the queries: it reads the two result sets together.
+    _annotate_internal_ips(blocked_internal, active_internal)
 
-            _annotate_internal_ips(top_blocked_internal_ips, top_active_internal_ips)
+    return {
+        'top_blocked_countries': countries.get('block', []),
+        'top_allowed_countries': countries.get('allow', []),
+        'top_blocked_services': services.get('block', []),
+        'top_allowed_services': services.get('allow', []),
+        'top_blocked_ips': results.get('blocked_ips') or [],
+        'top_blocked_internal_ips': blocked_internal,
+        'top_threat_ips': results.get('threat_ips') or [],
+        'top_allowed_destinations': results.get('allowed_destinations') or [],
+        'top_active_internal_ips': active_internal,
+        'top_dns': results.get('dns') or [],
+    }
 
-        conn.commit()
-        return {
-            'top_blocked_countries': top_blocked_countries,
-            'top_blocked_ips': top_blocked_ips,
-            'top_blocked_internal_ips': top_blocked_internal_ips,
-            'top_threat_ips': top_threat_ips,
-            'top_blocked_services': top_blocked_services,
-            'top_allowed_destinations': top_allowed_destinations,
-            'top_allowed_countries': top_allowed_countries,
-            'top_allowed_services': top_allowed_services,
-            'top_active_internal_ips': top_active_internal_ips,
-            'top_dns': top_dns,
-        }
-    except Exception as e:
-        conn.rollback()
-        logger.exception("Error fetching stats tables")
-        raise HTTPException(status_code=500, detail="Internal server error") from e
-    finally:
-        put_conn(conn)
+
+def _top_by_action(cur, sql, params, key):
+    """Split a (value, rule_action_id, count) result into per-action top tens.
+
+    One grouped query rather than two: the scan is the expensive part, and both
+    actions come out of the same pass over the window.
+    """
+    cur.execute(sql, params)
+    buckets = {'block': [], 'allow': []}
+    for row in cur.fetchall():
+        action = lookups.rule_action_text(row['rule_action_id'])
+        if action in buckets:
+            buckets[action].append({key: row[key], 'count': row['count']})
+    return {action: sorted(rows, key=lambda r: -r['count'])[:10]
+            for action, rows in buckets.items()}
+
+
+def _query_top_countries(cur, cutoff):
+    """Top countries, blocked and allowed.
+
+    Reads the base table, not the view: geo_country is a real column, so none of
+    the view's eleven joins would contribute anything here.
+    """
+    return _top_by_action(
+        cur,
+        f"SELECT geo_country AS country, rule_action_id, COUNT(*) AS count FROM logs "
+        f"WHERE timestamp >= %s AND rule_action_id IN ({_RA_BLOCK}, {_RA_ALLOW}) "
+        f"AND geo_country IS NOT NULL "
+        f"AND (rule_action_id = {_RA_BLOCK} OR direction_id = {_DIR_OUTBOUND}) "
+        f"GROUP BY geo_country, rule_action_id",
+        [cutoff], 'country')
+
+
+def _query_top_services(cur, cutoff):
+    """Top services, blocked and allowed.
+
+    Grouped by port and protocol — the columns that are stored — and mapped to
+    service names afterwards, over the handful of surviving groups rather than
+    every row in the window.
+    """
+    cur.execute(
+        f"SELECT dst_port, protocol_id, rule_action_id, COUNT(*) AS count FROM logs "
+        f"WHERE timestamp >= %s AND rule_action_id IN ({_RA_BLOCK}, {_RA_ALLOW}) "
+        f"AND dst_port IS NOT NULL "
+        f"GROUP BY dst_port, protocol_id, rule_action_id",
+        [cutoff]
+    )
+    buckets = {'block': {}, 'allow': {}}
+    for row in cur.fetchall():
+        action = lookups.rule_action_text(row['rule_action_id'])
+        if action not in buckets:
+            continue
+        protocol = enricher_db.lookups.protocols.text_for(row['protocol_id'])
+        name = get_service_name(row['dst_port'], protocol)
+        if not name:
+            continue
+        buckets[action][name] = buckets[action].get(name, 0) + row['count']
+    return {
+        action: sorted(
+            ({'service_name': n, 'count': c} for n, c in names.items()),
+            key=lambda r: -r['count'])[:10]
+        for action, names in buckets.items()
+    }
 
 
 @router.get("/api/stats/charts")
@@ -526,24 +589,24 @@ def get_stats_charts(
 
     bucket = _get_bucket(time_range)
 
-    conn = get_conn()
+    # Two independent scans of the same window; run together rather than added up.
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            logs_over_time = _query_logs_over_time(cur, cutoff, bucket)
-            traffic_by_action = _query_traffic_by_action(cur, cutoff, bucket)
-
-        conn.commit()
-        return {
-            'logs_over_time': logs_over_time,
-            'logs_per_hour': logs_over_time,  # backward-compat alias
-            'traffic_by_action': traffic_by_action,
-        }
+        results = run_queries({
+            'over_time': lambda cur: _query_logs_over_time(cur, cutoff, bucket),
+            'by_action': lambda cur: _query_traffic_by_action(cur, cutoff, bucket),
+        }, connect=get_conn, release=put_conn,
+            # An empty series looks like quiet, not like a failure.
+            required=('over_time', 'by_action'))
     except Exception as e:
-        conn.rollback()
         logger.exception("Error fetching stats charts")
         raise HTTPException(status_code=500, detail="Internal server error") from e
-    finally:
-        put_conn(conn)
+
+    logs_over_time = results.get('over_time') or []
+    return {
+        'logs_over_time': logs_over_time,
+        'logs_per_hour': logs_over_time,  # backward-compat alias
+        'traffic_by_action': results.get('by_action') or [],
+    }
 
 
 @router.get("/api/stats/ip-pairs")
@@ -584,8 +647,8 @@ def get_ip_pairs(
             src_ip, dst_ip, dst_port, LOWER(protocol) AS protocol,
             MAX(service_name) AS service_name,
             COUNT(*) AS total_count,
-            COUNT(*) FILTER (WHERE rule_action = 'allow') AS allow_count,
-            COUNT(*) FILTER (WHERE rule_action = 'block') AS block_count,
+            COUNT(*) FILTER (WHERE rule_action_id = {_RA_ALLOW}) AS allow_count,
+            COUNT(*) FILTER (WHERE rule_action_id = {_RA_BLOCK}) AS block_count,
             MAX(threat_score) AS max_threat_score,
             MAX(asn_name) AS asn_name,
             MAX(direction) AS direction
@@ -668,8 +731,8 @@ def get_ip_pairs_csv(
         host(src_ip) AS source_ip, host(dst_ip) AS destination_ip,
         dst_port AS port, LOWER(protocol) AS protocol,
         MODE() WITHIN GROUP (ORDER BY service_name) AS service,
-        COUNT(*) FILTER (WHERE rule_action = 'allow') AS allow_count,
-        COUNT(*) FILTER (WHERE rule_action = 'block') AS block_count
+        COUNT(*) FILTER (WHERE rule_action_id = {_RA_ALLOW}) AS allow_count,
+        COUNT(*) FILTER (WHERE rule_action_id = {_RA_BLOCK}) AS block_count
     FROM logs_text
     WHERE {where}
       AND src_ip IS NOT NULL AND dst_ip IS NOT NULL

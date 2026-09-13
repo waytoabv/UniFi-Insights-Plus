@@ -84,3 +84,31 @@ class TestPostBootIndexes:
         for dropped in ('idx_logs_type_id', 'idx_logs_src_port',
                         'idx_logs_protocol', 'idx_logs_service_name'):
             assert dropped not in recreated
+
+
+class TestNoUnrenderedPlaceholders:
+    """A literal that lost its f prefix ships '{_RA_BLOCK}' to PostgreSQL.
+
+    It is silent until the query runs, and grep cannot tell a broken literal
+    from a working f-string, so the check walks the AST instead: an f-string is
+    a JoinedStr and cannot carry an unrendered placeholder, while a plain
+    Constant containing one is always a bug.
+    """
+
+    @pytest.mark.parametrize('module_path', [
+        'db.py', 'query_helpers.py', 'routes/stats.py', 'routes/flows.py',
+        'routes/logs.py', 'routes/setup.py',
+    ])
+    def test_no_constant_carries_a_placeholder(self, module_path):
+        import pathlib
+        source = (pathlib.Path(__file__).parent.parent / module_path).read_text(encoding='utf-8')
+        offenders = [
+            node.lineno
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+            and re.search(r'\{_[A-Z][A-Z_]*\}', node.value)
+        ]
+        assert not offenders, (
+            f"{module_path}: literal with an unrendered placeholder at "
+            f"line(s) {offenders} — the f prefix is missing"
+        )

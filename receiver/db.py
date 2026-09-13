@@ -400,46 +400,61 @@ class Database:
         )
         logger.info("PostgreSQL connection pool ready (min=%d, max=%d)", self.min_conn, self.max_conn)
         self._ensure_schema()
-        self._populate_services()
         # Warm the lookup caches now so the first insert does not pay for four
-        # table reads while the UDP receive loop is waiting on it.
+        # table reads while the UDP receive loop is waiting on it — and because
+        # the reference tables below need the protocol ids.
         self._lookups = LogLookups(self)
+        self._populate_reference_tables()
 
-    def _populate_services(self):
-        """Load the IANA service names into the services table.
+    def _populate_reference_tables(self):
+        """Fill the tables the logs_text view resolves against.
 
-        service_name is no longer a column on logs — it is a function of port
-        and protocol. The API resolves it in Python, but the logs_text view
-        needs it in SQL, so the same mapping is mirrored into a table here.
+        The closed sets mirror lookups.CLOSED_SETS, and the services table
+        mirrors the bundled IANA mapping. Both exist so the view can resolve in
+        SQL what the API resolves in Python — and, more importantly, so those
+        joins are droppable: PostgreSQL removes a LEFT JOIN whose right side is
+        unique on the join key and unused by the query, which is what keeps an
+        aggregate over millions of rows from paying for eleven of them.
 
-        Runs once: the table is only filled when empty, and the CSV only
-        changes with a release.
+        Idempotent; the contents only change with a release.
         """
         try:
             from services import get_service_mappings
 
             with self.get_conn() as conn:
                 with conn.cursor() as cur:
+                    for table, kind in (('log_types', 'log_type'),
+                                        ('rule_actions', 'rule_action'),
+                                        ('directions', 'direction')):
+                        extras.execute_values(
+                            cur,
+                            f"INSERT INTO {table} (id, name) VALUES %s "
+                            f"ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
+                            [(v, k) for k, v in lookups.CLOSED_SETS[kind].items()],
+                        )
+
                     cur.execute("SELECT 1 FROM services LIMIT 1")
-                    if cur.fetchone() is not None:
-                        return
-                    rows = [(port, proto, name)
-                            for (port, proto), name in get_service_mappings().items()
-                            if name]
-                    if not rows:
-                        return
-                    extras.execute_values(
-                        cur,
-                        "INSERT INTO services (port, proto, name) VALUES %s "
-                        "ON CONFLICT (port, proto) DO NOTHING",
-                        rows, page_size=1000,
-                    )
+                    if cur.fetchone() is None:
+                        protocol_ids = {
+                            name: self.lookups.protocols.id_for(name)
+                            for name in {p for _, p in get_service_mappings()}
+                        }
+                        rows = [(port, protocol_ids.get(proto), name)
+                                for (port, proto), name in get_service_mappings().items()
+                                if name and protocol_ids.get(proto) is not None]
+                        if rows:
+                            extras.execute_values(
+                                cur,
+                                "INSERT INTO services (port, proto_id, name) VALUES %s "
+                                "ON CONFLICT (port, proto_id) DO NOTHING",
+                                rows, page_size=1000,
+                            )
+                            logger.info("Loaded %d IANA service names", len(rows))
                     conn.commit()
-            logger.info("Loaded %d IANA service names", len(rows))
         except Exception:
             # A missing service name degrades the view to NULL, which the UI
             # already renders as "Unknown". Not worth failing start-up over.
-            logger.warning("Could not populate the services table", exc_info=True)
+            logger.warning("Could not populate the reference tables", exc_info=True)
 
     def _ensure_schema(self):
         """Run idempotent schema migrations (safe on every boot).
@@ -520,6 +535,20 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_logs_type_time    ON logs (log_type_id, timestamp DESC)",
             "CREATE INDEX IF NOT EXISTS idx_logs_action_time  ON logs (rule_action_id, timestamp DESC)",
             "CREATE INDEX IF NOT EXISTS idx_logs_dst_port     ON logs (dst_port) WHERE dst_port IS NOT NULL",
+            # Dashboard aggregates.
+            #
+            # Partial on geo_country: only public addresses carry one, which on a
+            # home network is a few per cent of rows, so the index is small while
+            # ruling out almost everything the countries panel does not want.
+            # Covering, so the panel is answered without touching the heap.
+            f"""CREATE INDEX IF NOT EXISTS idx_logs_geo_time
+                ON logs (timestamp DESC, geo_country, rule_action_id, direction_id)
+                WHERE geo_country IS NOT NULL""",
+            # The two chart series scan the whole window and need only these
+            # three columns; as an index-only scan that is a fraction of the
+            # heap traffic.
+            f"""CREATE INDEX IF NOT EXISTS idx_logs_time_type_action
+                ON logs (timestamp DESC, log_type_id, rule_action_id)""",
             "DROP INDEX IF EXISTS idx_logs_type_id",
             "DROP INDEX IF EXISTS idx_logs_src_port",
             "DROP INDEX IF EXISTS idx_logs_protocol",
@@ -881,12 +910,40 @@ class Database:
                 ON protocols (lower(name))""",
             # IANA service names, so the compatibility view below can resolve
             # service_name without the column being stored per row. Populated
-            # once from the bundled CSV by _populate_services().
+            # once from the bundled CSV by _populate_reference_tables().
+            #
+            # Keyed on protocol_id rather than the protocol's name: joining on a
+            # name would make this join depend on the protocols join, and a
+            # dependent join cannot be dropped when the query does not use it.
+            # An install from before the key changed still has `proto VARCHAR`.
+            # The contents are derived from a bundled file, so dropping and
+            # refilling costs nothing.
+            """DO $$ BEGIN
+                IF EXISTS (SELECT 1 FROM information_schema.columns
+                           WHERE table_name = 'services' AND column_name = 'proto') THEN
+                    DROP VIEW IF EXISTS logs_text;
+                    DROP TABLE services;
+                END IF;
+            END $$;""",
             """CREATE TABLE IF NOT EXISTS services (
-                port   INTEGER NOT NULL,
-                proto  VARCHAR(10) NOT NULL,
-                name   TEXT NOT NULL,
-                PRIMARY KEY (port, proto)
+                port      INTEGER NOT NULL,
+                proto_id  SMALLINT NOT NULL,
+                name      TEXT NOT NULL,
+                PRIMARY KEY (port, proto_id)
+            )""",
+            # The closed sets are tables, not inline VALUES lists, for the same
+            # reason: PostgreSQL can drop a LEFT JOIN whose right side is unique
+            # on the join key and unused by the query, which turns the view back
+            # into a plain scan of logs for an aggregate that only needs
+            # geo_country or a timestamp. It cannot do that for a VALUES list.
+            """CREATE TABLE IF NOT EXISTS log_types (
+                id SMALLINT PRIMARY KEY, name VARCHAR(20) NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS rule_actions (
+                id SMALLINT PRIMARY KEY, name VARCHAR(20) NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS directions (
+                id SMALLINT PRIMARY KEY, name VARCHAR(20) NOT NULL
             )""",
             # ── Compatibility view ────────────────────────────────────────
             # Aggregate queries in stats.py, flows.py, mcp.py and threats.py
@@ -916,12 +973,9 @@ class Database:
                        ddn.name         AS dst_device_name,
                        sv.name          AS service_name
                 FROM logs l
-                LEFT JOIN """ + lookups.sql_values_clause('log_type') + """
-                     AS lt(id, name) ON lt.id = l.log_type_id
-                LEFT JOIN """ + lookups.sql_values_clause('rule_action') + """
-                     AS ra(id, name) ON ra.id = l.rule_action_id
-                LEFT JOIN """ + lookups.sql_values_clause('direction') + """
-                     AS dr(id, name) ON dr.id = l.direction_id
+                LEFT JOIN log_types    lt  ON lt.id  = l.log_type_id
+                LEFT JOIN rule_actions ra  ON ra.id  = l.rule_action_id
+                LEFT JOIN directions   dr  ON dr.id  = l.direction_id
                 LEFT JOIN protocols    p   ON p.id   = l.protocol_id
                 LEFT JOIN rules        r   ON r.id   = l.rule_id
                 LEFT JOIN interfaces   ii  ON ii.id  = l.iface_in_id
@@ -930,7 +984,7 @@ class Database:
                 LEFT JOIN device_names sdn ON sdn.id = l.src_device_id
                 LEFT JOIN device_names ddn ON ddn.id = l.dst_device_id
                 LEFT JOIN services     sv  ON sv.port = l.dst_port
-                                          AND sv.proto = p.name""",
+                                          AND sv.proto_id = l.protocol_id""",
         ]
         try:
             with self.get_conn() as conn:

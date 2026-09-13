@@ -6,6 +6,7 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Optional
 
+import lookups
 from fastapi import APIRouter, Query, HTTPException
 
 from psycopg2.extras import RealDictCursor
@@ -16,6 +17,21 @@ from ip_identity import load_identity_config, annotate_ip
 from query_helpers import (build_log_query, validate_time_params, ALLOWED_DIMENSIONS,
                           device_name_client_lateral, device_name_device_lateral,
                           device_name_coalesce)
+
+# Closed-set ids inlined into the aggregate SQL below.
+#
+# These filter on the base table's id columns rather than the view's text ones.
+# A text comparison would have to resolve the lookup first, which puts
+# idx_logs_action_time and idx_logs_type_time out of reach — the difference
+# between an index scan and reading every row in the window.
+_RA_ALLOW = lookups.rule_action_id('allow')
+_RA_BLOCK = lookups.rule_action_id('block')
+_RA_REDIRECT = lookups.rule_action_id('redirect')
+_LT_FIREWALL = lookups.log_type_id('firewall')
+_LT_DNS = lookups.log_type_id('dns')
+_DIR_INBOUND = lookups.direction_id('inbound')
+_DIR_OUTBOUND = lookups.direction_id('outbound')
+
 
 logger = logging.getLogger('api.flows')
 
@@ -307,17 +323,21 @@ def get_zone_matrix(
         search=None, service=None, interface=None,
     )
 
+    # Grouped on the interface ids, not their names: there are single digits of
+    # each, so resolving after the GROUP BY costs a dict lookup per cell — while
+    # grouping on the view's text columns would join both interface tables
+    # against every row in the window first.
     sql = f"""
     SELECT
-        interface_in, interface_out,
+        iface_in_id, iface_out_id,
         COUNT(*) AS total,
-        COUNT(*) FILTER (WHERE rule_action = 'allow') AS allow_count,
-        COUNT(*) FILTER (WHERE rule_action = 'block') AS block_count,
+        COUNT(*) FILTER (WHERE rule_action_id = {_RA_ALLOW}) AS allow_count,
+        COUNT(*) FILTER (WHERE rule_action_id = {_RA_BLOCK}) AS block_count,
         COUNT(DISTINCT (host(src_ip) || '-' || host(dst_ip))) AS unique_pairs
-    FROM logs_text
+    FROM logs
     WHERE {where}
-      AND interface_in IS NOT NULL AND interface_out IS NOT NULL
-    GROUP BY interface_in, interface_out
+      AND iface_in_id IS NOT NULL AND iface_out_id IS NOT NULL
+    GROUP BY iface_in_id, iface_out_id
     ORDER BY total DESC
     """
 
@@ -330,20 +350,25 @@ def get_zone_matrix(
             rows = cur.fetchall()
         conn.commit()
 
-        interfaces = sorted({r['interface_in'] for r in rows} | {r['interface_out'] for r in rows})
-        cells = [
-            {
-                "interface_in": r['interface_in'],
-                "interface_out": r['interface_out'],
-                "in_label": labels.get(r['interface_in'], r['interface_in']),
-                "out_label": labels.get(r['interface_out'], r['interface_out']),
+        # Names are attached here, over the cells rather than the rows behind them.
+        iface = enricher_db.lookups.interfaces
+        cells = []
+        for r in rows:
+            name_in = iface.text_for(r['iface_in_id'])
+            name_out = iface.text_for(r['iface_out_id'])
+            if not name_in or not name_out:
+                continue
+            cells.append({
+                "interface_in": name_in,
+                "interface_out": name_out,
+                "in_label": labels.get(name_in, name_in),
+                "out_label": labels.get(name_out, name_out),
                 "total": r['total'],
                 "allow_count": r['allow_count'],
                 "block_count": r['block_count'],
                 "unique_pairs": r['unique_pairs'],
-            }
-            for r in rows
-        ]
+            })
+        interfaces = sorted({c['interface_in'] for c in cells} | {c['interface_out'] for c in cells})
 
         return {
             "cells": cells,
@@ -394,8 +419,8 @@ def get_host_detail(
             cur.execute(f"""
                 SELECT
                     COUNT(*) AS total_events,
-                    COUNT(*) FILTER (WHERE rule_action = 'allow') AS allow_count,
-                    COUNT(*) FILTER (WHERE rule_action = 'block') AS block_count,
+                    COUNT(*) FILTER (WHERE rule_action_id = {_RA_ALLOW}) AS allow_count,
+                    COUNT(*) FILTER (WHERE rule_action_id = {_RA_BLOCK}) AS block_count,
                     COUNT(DISTINCT CASE WHEN src_ip = %s::inet THEN host(dst_ip) ELSE host(src_ip) END) AS unique_peers,
                     MIN(timestamp) AS first_seen,
                     MAX(timestamp) AS last_seen,
@@ -448,8 +473,8 @@ def get_host_detail(
             cur.execute(f"""
                 SELECT host(dst_ip) AS peer_ip,
                        COUNT(*) AS count,
-                       COUNT(*) FILTER (WHERE rule_action = 'allow') AS allow_count,
-                       COUNT(*) FILTER (WHERE rule_action = 'block') AS block_count,
+                       COUNT(*) FILTER (WHERE rule_action_id = {_RA_ALLOW}) AS allow_count,
+                       COUNT(*) FILTER (WHERE rule_action_id = {_RA_BLOCK}) AS block_count,
                        MAX(asn_name) AS asn_name,
                        MAX(rdns) AS rdns
                 FROM logs_text
@@ -466,8 +491,8 @@ def get_host_detail(
             cur.execute(f"""
                 SELECT host(src_ip) AS peer_ip,
                        COUNT(*) AS count,
-                       COUNT(*) FILTER (WHERE rule_action = 'allow') AS allow_count,
-                       COUNT(*) FILTER (WHERE rule_action = 'block') AS block_count,
+                       COUNT(*) FILTER (WHERE rule_action_id = {_RA_ALLOW}) AS allow_count,
+                       COUNT(*) FILTER (WHERE rule_action_id = {_RA_BLOCK}) AS block_count,
                        MAX(asn_name) AS asn_name,
                        MAX(rdns) AS rdns
                 FROM logs_text

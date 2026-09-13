@@ -123,6 +123,20 @@ CREATE INDEX IF NOT EXISTS idx_logs_zone_matrix
 -- Indexes for newly exposed filters
 CREATE INDEX IF NOT EXISTS idx_logs_dst_port     ON logs (dst_port) WHERE dst_port IS NOT NULL;
 
+-- Dashboard aggregates.
+--
+-- Partial on geo_country: only public addresses carry one, which on a home
+-- network is a few per cent of rows, so the index stays small while ruling out
+-- almost everything the countries panel does not want. Covering, so the panel
+-- is answered without touching the heap.
+CREATE INDEX IF NOT EXISTS idx_logs_geo_time
+    ON logs (timestamp DESC, geo_country, rule_action_id, direction_id)
+    WHERE geo_country IS NOT NULL;
+
+-- The two chart series scan the whole window and need only these three columns.
+CREATE INDEX IF NOT EXISTS idx_logs_time_type_action
+    ON logs (timestamp DESC, log_type_id, rule_action_id);
+
 -- Targeted backfill indexes (issue #67: avoid full-table scans)
 CREATE INDEX IF NOT EXISTS idx_logs_fw_block_null_threat_src
     ON logs (src_ip)
