@@ -216,7 +216,6 @@ def test_ensure_post_boot_indexes_creates_when_missing(monkeypatch):
     executed_sql = ' '.join(str(c) for c in mock_cursor.execute.call_args_list)
     assert 'CREATE INDEX CONCURRENTLY' in executed_sql
     assert 'spgist' in executed_sql.lower()
-    assert 'idx_logs_type_id' in executed_sql
     assert 'idx_logs_nondns_timestamp' in executed_sql
     assert mock_conn.autocommit is True
 
@@ -246,7 +245,7 @@ def test_ensure_post_boot_indexes_continues_after_single_failure(monkeypatch):
         call_count[0] += 1
         if isinstance(sql, str) and 'pg_indexes' in sql:
             return  # fetchone returns None (index missing)
-        if isinstance(sql, str) and 'idx_logs_type_id' in sql:
+        if isinstance(sql, str) and 'idx_logs_nondns_timestamp' in sql:
             raise Exception("simulated CREATE INDEX failure")
 
     mock_cursor = MagicMock()
@@ -265,7 +264,7 @@ def test_ensure_post_boot_indexes_continues_after_single_failure(monkeypatch):
 
     # Should have warned about the failed index
     warning_calls = [c for c in mock_logger.warning.call_args_list
-                     if 'idx_logs_type_id' in str(c)]
+                     if 'idx_logs_nondns_timestamp' in str(c)]
     assert len(warning_calls) == 1
     # Should have attempted all 3 indexes (check + create for each = 6 execute calls,
     # minus the one that failed mid-create). Just verify more than 2 execute calls
@@ -309,8 +308,9 @@ def test_post_boot_index_list_has_expected_entries():
     """_POST_BOOT_INDEXES contains all expected upgrade indexes."""
     names = {idx['name'] for idx in Database._POST_BOOT_INDEXES}
     assert 'idx_logs_spgist_dst_ip_firewall' in names
-    assert 'idx_logs_type_id' in names
     assert 'idx_logs_nondns_timestamp' in names
+    # idx_logs_type_id was removed: 319 MB serving one measured scan in a day.
+    assert 'idx_logs_type_id' not in names
 
 
 def test_post_boot_indexes_all_use_concurrently():
