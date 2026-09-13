@@ -345,7 +345,17 @@ def main():
     cur.execute("ALTER INDEX IF EXISTS logs_new_pkey RENAME TO logs_pkey")
     # logs_new was created with a plain BIGINT id so the copy could carry the
     # original ids; the sequence is attached here and set past the high-water mark.
-    cur.execute("CREATE SEQUENCE IF NOT EXISTS logs_id_seq OWNED BY logs.id")
+    #
+    # CREATE SEQUENCE IF NOT EXISTS would be wrong here for the same reason the
+    # index names were: the original table's sequence still exists under this
+    # name, now owned by logs_old.id. The IF NOT EXISTS would skip, leaving the
+    # new table using a sequence PostgreSQL considers part of the old one — and
+    # DROP TABLE logs_old would then refuse, or with CASCADE take the sequence
+    # with it and break every insert.
+    cur.execute("SELECT 1 FROM pg_class WHERE relname = 'logs_id_seq' AND relkind = 'S'")
+    if cur.fetchone() is None:
+        cur.execute("CREATE SEQUENCE logs_id_seq")
+    cur.execute("ALTER SEQUENCE logs_id_seq OWNED BY logs.id")
     cur.execute("ALTER TABLE logs ALTER COLUMN id SET DEFAULT nextval('logs_id_seq')")
     cur.execute("SELECT setval('logs_id_seq', %s)", [max_id + 1])
     conn.commit()
@@ -374,6 +384,28 @@ def main():
         return 1
     cur.execute("""SELECT pg_size_pretty(pg_indexes_size('logs'))""")
     logger.info("Indexes on logs: %d, %s", len(present), cur.fetchone()[0])
+
+    cur.execute("""
+        SELECT c.relname
+        FROM pg_depend d
+        JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S'
+        JOIN pg_class c ON c.oid = d.refobjid
+        WHERE s.relname = 'logs_id_seq' AND d.deptype = 'a'
+    """)
+    owner = cur.fetchone()
+    if not owner or owner[0] != 'logs':
+        logger.error("logs_id_seq is owned by %s, not logs. Dropping logs_old would "
+                     "take the sequence with it. Fix with: "
+                     "ALTER SEQUENCE logs_id_seq OWNED BY logs.id",
+                     owner[0] if owner else 'nothing')
+        return 1
+
+    cur.execute("SELECT last_value FROM logs_id_seq")
+    seq_value = cur.fetchone()[0]
+    if seq_value <= max_id:
+        logger.error("logs_id_seq is at %s but the highest id is %s — the next insert "
+                     "would collide.", f"{seq_value:,}", f"{max_id:,}")
+        return 1
 
     logger.info("Done. The previous table is kept as logs_old (%s).", table_size(cur, 'logs_old'))
     logger.info("Start the services, check the dashboard, then drop it:")

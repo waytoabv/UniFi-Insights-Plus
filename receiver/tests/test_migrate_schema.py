@@ -5,8 +5,10 @@ column sets have to agree. A mismatch would only surface as a crash after the
 swap, with the old table already renamed.
 """
 
+import ast
 import inspect
 import re
+import textwrap
 
 import lookups
 import migrate_schema as m
@@ -16,6 +18,22 @@ from db import INSERT_COLUMNS
 def _insert_columns(sql):
     body = sql.split('INSERT INTO logs_new (', 1)[1].split(')', 1)[0]
     return [c.strip() for c in body.split(',')]
+
+
+def _executed_sql(func):
+    """String literals actually passed to cur.execute(), ignoring comments.
+
+    Checking the raw source would also match prose explaining why a construct
+    is wrong, which is exactly what several of these comments do.
+    """
+    tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+    out = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == 'execute' and node.args
+                and isinstance(node.args[0], ast.Constant)):
+            out.append(node.args[0].value)
+    return out
 
 
 class TestColumnAgreement:
@@ -111,3 +129,33 @@ class TestIndexNameCollision:
     def test_result_is_verified_not_assumed(self):
         source = inspect.getsource(m.main)
         assert "were not created on the new table" in source
+
+
+class TestSequenceOwnership:
+    """The id sequence survives the rename under its old owner.
+
+    The original table's logs_id_seq still exists after the swap, owned by
+    logs_old.id. CREATE SEQUENCE IF NOT EXISTS would find the name taken and
+    skip, leaving the new table using a sequence PostgreSQL still considers
+    part of the old one — so DROP TABLE logs_old refuses, and CASCADE would
+    take the sequence with it and break every subsequent insert.
+    """
+
+    def test_ownership_is_reassigned_explicitly(self):
+        source = inspect.getsource(m.main)
+        assert 'ALTER SEQUENCE logs_id_seq OWNED BY logs.id' in source
+
+    def test_create_is_guarded_by_a_lookup_not_if_not_exists(self):
+        executed = _executed_sql(m.main)
+        assert not [q for q in executed if 'CREATE SEQUENCE IF NOT EXISTS' in q], \
+            "IF NOT EXISTS would skip: the name is still held by the old table's sequence"
+        assert any("relname = 'logs_id_seq' AND relkind = 'S'" in q for q in executed)
+
+    def test_ownership_is_verified_before_reporting_success(self):
+        source = inspect.getsource(m.main)
+        assert 'is owned by %s, not logs' in source
+
+    def test_sequence_position_is_verified(self):
+        """A sequence behind max(id) makes the next insert collide."""
+        source = inspect.getsource(m.main)
+        assert 'would collide' in source
