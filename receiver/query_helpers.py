@@ -8,6 +8,7 @@ from typing import Optional
 
 import lookups
 import services
+from search_query import parse_search
 
 logger = logging.getLogger(__name__)
 
@@ -305,8 +306,10 @@ def build_log_query(
         params.append(threat_min)
 
     if search:
-        negated, val = _parse_negation(search)
-        sql, bound = _search_condition(val, negated)
+        # No _parse_negation here: the search parser handles '!' per term, so
+        # stripping a leading one first would turn "!443 tcp" into "not (443 and
+        # tcp)" instead of "not 443, and tcp".
+        sql, bound = _search_condition(search, negated=False)
         conditions.append(sql)
         params.extend(bound)
 
@@ -396,20 +399,16 @@ def build_log_query(
     return where, params
 
 
-# Text columns the free-text search covers directly.
-#
-# Everything displayed in the log table is searchable, which is the point: a
-# search for a country code, an ASN, a reverse-DNS name or a DNS query now
-# finds rows, where the previous raw_log-only search could only match what the
-# gateway happened to put on the wire.
-_SEARCH_TEXT_COLUMNS = (
-    'src_ip::text', 'dst_ip::text', 'rdns', 'geo_country', 'geo_city',
-    'asn_name', 'dns_query', 'dns_answer', 'dhcp_event', 'wifi_event',
-    'mac_address::text', 'src_port::text', 'dst_port::text',
+# Text columns a plain word is searched against. Everything that is not text —
+# addresses, ports, protocols, rules, device names — is matched by type instead,
+# so it can use an index.
+_TEXT_COLUMNS = (
+    'rdns', 'geo_country', 'geo_city', 'asn_name',
+    'dns_query', 'dns_answer', 'dhcp_event', 'wifi_event',
 )
 
-# Lookup-backed columns: resolved to id lists in Python, then matched as IN.
-_SEARCH_LOOKUP_COLUMNS = (
+# Lookup-backed columns a word may name. Resolved to id lists in Python.
+_TEXT_LOOKUPS = (
     ('rules', 'rule_id'),
     ('protocols', 'protocol_id'),
     ('interfaces', 'iface_in_id'),
@@ -419,56 +418,165 @@ _SEARCH_LOOKUP_COLUMNS = (
     ('device_names', 'hostname_id'),
 )
 
-# Closed-set columns, matched against the words the UI displays.
-_SEARCH_CLOSED_COLUMNS = (
+# Closed sets, matched against the words the UI displays.
+_TEXT_CLOSED = (
     ('log_type', 'log_type_id'),
     ('rule_action', 'rule_action_id'),
     ('direction', 'direction_id'),
 )
 
+# Which columns a field-scoped term restricts to.
+_SCOPE_COLUMNS = {
+    'src_ip': ('src_ip',),
+    'dst_ip': ('dst_ip',),
+    'ip': ('src_ip', 'dst_ip'),
+    'src_port': ('src_port',),
+    'dst_port': ('dst_port',),
+    'port': ('src_port', 'dst_port'),
+}
 
-def _search_condition(value: str, negated: bool) -> tuple[str, list]:
-    """Free-text search across every displayed field.
 
-    Replaces the previous `raw_log ILIKE` search, which stopped working once
-    raw_log was no longer stored for parsed rows — and which could never match
-    anything the parser derived, such as a country, an ASN or a device name.
+def _address_condition(term) -> tuple[str, list]:
+    """Compare an address as an address.
 
-    Text columns are matched in SQL; id-backed columns are resolved to id lists
-    here and matched as IN, so one pattern reaches both kinds in a single OR.
+    An exact term uses equality and a subnet uses containment; both are
+    answerable from the inet index. Comparing the text form instead — which is
+    what a substring search does — both misses the index and makes 10.10.10.10
+    match 10.10.10.100.
     """
-    parts = []
-    params = []
-    escaped = f"%{_escape_like(value)}%"
+    columns = _SCOPE_COLUMNS.get(term.field) or ('src_ip', 'dst_ip')
+    operator = '=' if term.kind == 'ip' else '<<='
+    parts, params = [], []
+    for column in columns:
+        parts.append(f"{column} {operator} %s")
+        params.append(term.value)
+    return f"({' OR '.join(parts)})", params
 
-    for column in _SEARCH_TEXT_COLUMNS:
+
+def _port_condition(term) -> tuple[str, list]:
+    """Ports are numbers: 443 must not also match 4430."""
+    columns = _SCOPE_COLUMNS.get(term.field) or ('src_port', 'dst_port')
+    parts, params = [], []
+    for column in columns:
+        parts.append(f"{column} = %s")
+        params.append(term.value)
+    return f"({' OR '.join(parts)})", params
+
+
+def _mac_condition(term) -> tuple[str, list]:
+    return ("mac_address = %s", [term.value])
+
+
+def _scoped_text_condition(term) -> tuple[str, list]:
+    """A word restricted to one field by a prefix."""
+    value = str(term.value)
+    if term.field == 'rule':
+        return _id_condition('rule_id', _ids_matching('rules', value))
+    if term.field == 'protocol':
+        return _id_condition('protocol_id', _ids_matching('protocols', value))
+    if term.field == 'interface':
+        ids = _ids_matching('interfaces', value)
+        sql, params = _id_condition('iface_in_id', ids)
+        sql2, params2 = _id_condition('iface_out_id', ids)
+        return f"({sql} OR {sql2})", params + params2
+    if term.field == 'host':
+        ids = _ids_matching('device_names', value)
+        parts, params = [], []
+        for column in ('src_device_id', 'dst_device_id', 'hostname_id'):
+            sql, bound = _id_condition(column, ids)
+            parts.append(sql)
+            params.extend(bound)
+        return f"({' OR '.join(parts)})", params
+    if term.field == 'action':
+        return _id_condition('rule_action_id', closed_ids_containing('rule_action', value))
+    if term.field == 'log_type':
+        return _id_condition('log_type_id', closed_ids_containing('log_type', value))
+    if term.field == 'country':
+        return ("geo_country = %s", [value.upper()])
+    if term.field == 'asn':
+        return ("asn_name ILIKE %s ESCAPE '\\'", [f"%{_escape_like(value)}%"])
+    return _free_text_condition(term)
+
+
+def closed_ids_containing(kind, value):
+    """Ids of a closed set whose display word contains the term."""
+    needle = str(value).lower()
+    return [i for text, i in lookups.CLOSED_SETS[kind].items() if needle in text.lower()]
+
+
+def _free_text_condition(term) -> tuple[str, list]:
+    """An unscoped word: anywhere it is displayed."""
+    value = str(term.value)
+    parts, params = [], []
+
+    if term.glob:
+        pattern = _escape_like(value).replace('*', '%')
+    else:
+        pattern = f"%{_escape_like(value)}%"
+
+    for column in _TEXT_COLUMNS:
         parts.append(f"{column} ILIKE %s ESCAPE '\\'")
-        params.append(escaped)
+        params.append(pattern)
 
-    for table_name, column in _SEARCH_LOOKUP_COLUMNS:
+    for table_name, column in _TEXT_LOOKUPS:
         ids = _ids_matching(table_name, value)
         if ids:
             placeholders = ','.join(['%s'] * len(ids))
             parts.append(f"{column} IN ({placeholders})")
             params.extend(ids)
 
-    for kind, column in _SEARCH_CLOSED_COLUMNS:
-        ids = [i for text, i in lookups.CLOSED_SETS[kind].items()
-               if value.lower() in text.lower()]
+    for kind, column in _TEXT_CLOSED:
+        ids = closed_ids_containing(kind, value)
         if ids:
             placeholders = ','.join(['%s'] * len(ids))
             parts.append(f"{column} IN ({placeholders})")
             params.extend(ids)
 
-    # raw_log is only populated for lines the parser could not read, but those
+    # raw_log is only populated for lines the parser could not read — but those
     # are exactly the ones with nothing else to search.
     parts.append("raw_log ILIKE %s ESCAPE '\\'")
-    params.append(escaped)
+    params.append(pattern)
 
-    clause = f"({' OR '.join(parts)})"
+    return f"({' OR '.join(parts)})", params
+
+
+def _term_condition(term) -> tuple[str, list]:
+    if term.kind in ('ip', 'cidr'):
+        return _address_condition(term)
+    if term.kind == 'port':
+        return _port_condition(term)
+    if term.kind == 'mac':
+        return _mac_condition(term)
+    if term.field:
+        return _scoped_text_condition(term)
+    return _free_text_condition(term)
+
+
+def _search_condition(value: str, negated: bool) -> tuple[str, list]:
+    """Turn the search box's contents into a WHERE fragment.
+
+    Terms are ANDed: each one narrows the result, so the box doubles as a way
+    to stack filters without opening the filter panel.
+    """
+    terms = parse_search(value)
+    if not terms:
+        return ("1=1", [])
+
+    clauses, params = [], []
+    for term in terms:
+        sql, bound = _term_condition(term)
+        if term.negated:
+            # COALESCE, not a bare NOT: in SQL a comparison against NULL is
+            # NULL, not true, so `NOT (dst_port = 443)` drops every row without
+            # a port. Excluding 443 should not also hide ICMP.
+            sql = f"NOT COALESCE({sql}, FALSE)"
+        clauses.append(sql)
+        params.extend(bound)
+
+    clause = ' AND '.join(clauses)
     if negated:
-        return (f"NOT {clause}", params)
-    return (clause, params)
+        return (f"NOT ({clause})", params)
+    return (f"({clause})", params)
 
 
 def _escape_like(value: str) -> str:

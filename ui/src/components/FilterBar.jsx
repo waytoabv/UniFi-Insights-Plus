@@ -29,6 +29,23 @@ const RESET_FILTERS = {
   log_type: null, rule_action: null, direction: null, vpn_only: null,
 }
 
+// Shown as the search box's tooltip. Terms are ANDed, so the box doubles as a
+// way to stack filters without opening the panel.
+const SEARCH_HELP = [
+  'Every term must match. Press Enter to search.',
+  '',
+  '10.10.10.10      that address exactly',
+  '10.10.30.0/24    that subnet  (10.10.30.* works too)',
+  '443              that port, either end',
+  'nas              anywhere it is displayed',
+  '"allow new"      an exact phrase',
+  '!tcp             exclude',
+  '',
+  'Scope a term:  src: dst: ip: port: sport: dport:',
+  '               rule: host: iface: country: asn: proto: action: type:',
+].join('\n')
+
+
 export default function FilterBar({ filters, onChange, maxFilterDays, prefetchedInterfaces, hiddenLogTypes }) {
   const visibleLogTypes = hiddenLogTypes?.size
     ? LOG_TYPES.filter(t => !hiddenLogTypes.has(t))
@@ -131,11 +148,19 @@ export default function FilterBar({ filters, onChange, maxFilterDays, prefetched
     return () => clearTimeout(t)
   }, [ruleSearch]) // eslint-disable-line react-hooks/exhaustive-deps
 
+  // The search box submits on Enter rather than as you type. Its terms are
+  // structured — an address, a port, a field:value pair — and the intermediate
+  // states of typing one are themselves valid queries: "10.10.10.10" passes
+  // through "10.1" and "10.10.", each a different subnet and each a wasted
+  // round trip that briefly shows the wrong rows.
+  const submitSearch = useCallback((value) => {
+    wrappedOnChange({ ...filtersRef.current, search: value || null })
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Adopt a search term set from outside, e.g. a drill-down from the dashboard.
   useEffect(() => {
-    if (!mountedRef.current) return
-    const t = setTimeout(() => wrappedOnChange({ ...filtersRef.current, search: textSearch || null }), 400)
-    return () => clearTimeout(t)
-  }, [textSearch]) // eslint-disable-line react-hooks/exhaustive-deps
+    setTextSearch(filters.search || '')
+  }, [filters.search])
 
   useEffect(() => {
     if (!mountedRef.current) return
@@ -645,14 +670,23 @@ export default function FilterBar({ filters, onChange, maxFilterDays, prefetched
         <div className="relative flex-1 sm:max-w-xs">
           <input
             type="text"
-            placeholder="Search raw log..."
-            title="Prefix with ! to exclude matching log entries"
+            placeholder="Search — press Enter"
+            title={SEARCH_HELP}
             value={textSearch}
             onChange={e => setTextSearch(e.target.value)}
-            className={`w-full bg-black border rounded px-3 py-1.5 text-xs text-gray-300 placeholder-gray-500 focus:outline-none focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20 ${textSearch.startsWith('!') ? 'border-amber-400/60' : 'border-gray-700'}`}
+            onKeyDown={e => {
+              if (e.key === 'Enter') { e.preventDefault(); submitSearch(textSearch.trim()) }
+              if (e.key === 'Escape') { setTextSearch(''); submitSearch('') }
+            }}
+            className={`w-full bg-black border rounded px-3 py-1.5 text-xs text-gray-300 placeholder-gray-500 focus:outline-none focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20 ${
+              textSearch !== (filters.search || '') ? 'border-teal-500/60' : 'border-gray-700'
+            }`}
           />
           {textSearch && (
-            <button onClick={() => setTextSearch('')} className="absolute right-2 top-1.5 text-gray-400 hover:text-gray-200 text-xs">✕</button>
+            <button
+              onClick={() => { setTextSearch(''); submitSearch('') }}
+              className="absolute right-2 top-1.5 text-gray-400 hover:text-gray-200 text-xs"
+            >✕</button>
           )}
         </div>
         {activeFilterCount > 0 && (

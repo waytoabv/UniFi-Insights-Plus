@@ -497,19 +497,24 @@ class TestSearchCondition:
         defaults.update(kw)
         return build_log_query(**defaults)
 
-    def test_covers_ip_columns(self):
-        where, _ = self._build(search='10.10.30')
-        assert 'src_ip::text ILIKE' in where
-        assert 'dst_ip::text ILIKE' in where
+    def test_an_address_prefix_matches_the_subnet(self):
+        """Superseded substring matching: '10.10.30' now scopes to
+        10.10.30.0/24, which is both what was meant and indexable."""
+        where, params = self._build(search='10.10.30')
+        assert '<<=' in where
+        assert '10.10.30.0/24' in params
 
     def test_covers_enrichment_columns(self):
         where, _ = self._build(search='Google')
         for column in ('rdns', 'geo_country', 'geo_city', 'asn_name'):
             assert f'{column} ILIKE' in where
 
-    def test_covers_ports(self):
-        where, _ = self._build(search='443')
-        assert 'dst_port::text ILIKE' in where
+    def test_a_port_matches_exactly(self):
+        """Superseded substring matching: searching 443 no longer returns
+        4430 and 8443."""
+        where, params = self._build(search='443')
+        assert 'dst_port = %s' in where
+        assert 443 in params
 
     def test_matches_rule_names_through_the_lookup(self):
         where, params = self._build(search='IOT')
@@ -553,9 +558,16 @@ class TestSearchCondition:
         where, _ = self._build(search='anything')
         assert 'raw_log ILIKE' in where
 
-    def test_negation_wraps_the_whole_clause(self):
+    def test_negation_applies_per_term(self):
+        """'!' now binds to its own term, so "!tcp 443" means "not TCP, and
+        port 443" rather than "not (TCP and 443)"."""
         where, _ = self._build(search='!tcp')
-        assert where.count('NOT (') == 1
+        assert 'NOT COALESCE(' in where
+
+    def test_only_the_negated_term_is_excluded(self):
+        where, params = self._build(search='!tcp 443')
+        assert 'NOT COALESCE(' in where
+        assert 443 in params
 
     def test_terms_are_escaped(self):
         where, params = self._build(search='100%')
