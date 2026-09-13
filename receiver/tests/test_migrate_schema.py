@@ -159,3 +159,40 @@ class TestSequenceOwnership:
         """A sequence behind max(id) makes the next insert collide."""
         source = inspect.getsource(m.main)
         assert 'would collide' in source
+
+
+class TestRepairPath:
+    """An already-migrated database must still be checked over.
+
+    The first version returned immediately when it saw log_type_id, so the
+    fixes for the index-name and sequence-ownership bugs could never reach an
+    install that had already run the broken version — exactly the installs that
+    needed them.
+    """
+
+    def test_already_migrated_runs_the_repair(self):
+        source = inspect.getsource(m.main)
+        assert 'return repair(' in source, \
+            "an already-migrated database must be checked, not skipped"
+
+    def test_repair_creates_missing_indexes(self):
+        executed = _executed_sql(m.repair)
+        assert any('ALTER INDEX %I RENAME TO %I' in q for q in executed)
+
+    def test_repair_reassigns_sequence_ownership(self):
+        executed = _executed_sql(m.repair)
+        assert 'ALTER SEQUENCE logs_id_seq OWNED BY logs.id' in executed
+
+    def test_repair_advances_a_lagging_sequence(self):
+        executed = _executed_sql(m.repair)
+        assert any('setval' in q for q in executed)
+
+    def test_repair_honours_dry_run(self):
+        source = inspect.getsource(m.repair)
+        assert source.count('if dry_run:') >= 3, \
+            "every write in the repair path needs a dry-run branch"
+
+    def test_repair_tolerates_a_dropped_logs_old(self):
+        """The index rename is skipped when the old table is already gone."""
+        executed = _executed_sql(m.repair)
+        assert any("to_regclass('logs_old')" in q for q in executed)

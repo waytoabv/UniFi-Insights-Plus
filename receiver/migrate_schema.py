@@ -233,6 +233,96 @@ def write_cursor(cur, value: int):
     )
 
 
+def repair(conn, cur, dry_run=False) -> int:
+    """Check and fix what an earlier run of this script may have left undone.
+
+    The first version created the new indexes and the id sequence with
+    IF NOT EXISTS, while the renamed logs_old still held those names. Both
+    silently skipped: the table was left with only its primary key, and the
+    sequence stayed owned by the old table so DROP TABLE logs_old refused.
+
+    Exiting early on an already-migrated database meant the fix could never
+    reach an install that needed it, which is why this runs every time.
+    """
+    fixed = []
+
+    # Indexes the old table may still be holding the names of.
+    cur.execute("SELECT indexname FROM pg_indexes WHERE tablename = 'logs'")
+    present = {row[0] for row in cur.fetchall()}
+    expected = {'idx_' + sql.split('idx_')[1].split()[0] for sql in POST_COPY_INDEXES}
+    missing = sorted(expected - present)
+
+    if missing:
+        logger.warning("Missing on logs: %s", ', '.join(missing))
+        if dry_run:
+            logger.info("would free the old names and create them")
+        else:
+            cur.execute("SELECT to_regclass('logs_old')")
+            if cur.fetchone()[0] is not None:
+                logger.info("Renaming logs_old's indexes out of the way...")
+                cur.execute("""
+                    DO $$
+                    DECLARE r record;
+                    BEGIN
+                        FOR r IN SELECT indexname FROM pg_indexes
+                                 WHERE tablename = 'logs_old' AND indexname NOT LIKE '%_old'
+                        LOOP
+                            EXECUTE format('ALTER INDEX %I RENAME TO %I',
+                                           r.indexname, left(r.indexname, 55) || '_old');
+                        END LOOP;
+                    END $$
+                """)
+            for sql in POST_COPY_INDEXES:
+                name = 'idx_' + sql.split('idx_')[1].split()[0]
+                if name in missing:
+                    logger.info("  creating %s", name)
+                    cur.execute(sql)
+            conn.commit()
+            fixed.append(f"{len(missing)} index(es)")
+
+    # Sequence ownership: DROP TABLE logs_old refuses while it points at the old table.
+    cur.execute("""
+        SELECT c.relname
+        FROM pg_depend d
+        JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S'
+        JOIN pg_class c ON c.oid = d.refobjid
+        WHERE s.relname = 'logs_id_seq' AND d.deptype = 'a'
+    """)
+    owner = cur.fetchone()
+    if owner and owner[0] != 'logs':
+        logger.warning("logs_id_seq is owned by %s, not logs.", owner[0])
+        if dry_run:
+            logger.info("would reassign it to logs.id")
+        else:
+            cur.execute("ALTER SEQUENCE logs_id_seq OWNED BY logs.id")
+            conn.commit()
+            fixed.append("sequence ownership")
+
+    # A sequence behind max(id) makes the next insert collide.
+    cur.execute("SELECT last_value FROM logs_id_seq")
+    seq_value = cur.fetchone()[0]
+    cur.execute("SELECT COALESCE(MAX(id), 0) FROM logs")
+    high = cur.fetchone()[0]
+    if seq_value <= high:
+        logger.warning("logs_id_seq is at %s, highest id is %s.", f"{seq_value:,}", f"{high:,}")
+        if dry_run:
+            logger.info("would advance it past the highest id")
+        else:
+            cur.execute("SELECT setval('logs_id_seq', %s)", [high + 1])
+            conn.commit()
+            fixed.append("sequence position")
+
+    if fixed:
+        logger.info("Repaired: %s", ', '.join(fixed))
+        cur.execute("SELECT to_regclass('logs_old')")
+        if cur.fetchone()[0] is not None:
+            logger.info("logs_old can now be dropped: "
+                        "sudo -u postgres psql -d unifi_logs -c 'DROP TABLE logs_old'")
+    elif not dry_run:
+        logger.info("Nothing to fix.")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--dry-run', action='store_true',
@@ -245,8 +335,8 @@ def main():
     cur = conn.cursor()
 
     if already_migrated(cur):
-        logger.info("logs already has log_type_id — nothing to do.")
-        return 0
+        logger.info("Schema is already normalised — checking it over.")
+        return repair(conn, cur, dry_run=args.dry_run)
 
     cur.execute("SELECT COUNT(*), COALESCE(MAX(id), 0) FROM logs")
     total, max_id = cur.fetchone()
