@@ -2,7 +2,18 @@ import { useState } from 'react'
 import { formatNumber } from '../utils'
 import ReleaseNotesModal, { isNewerVersion } from './ReleaseNotesModal'
 
-export default function Pagination({ page, pages, total, perPage, onChange, version, latestRelease }) {
+/**
+ * Footer bar: result position on the left, version in the middle, navigation
+ * on the right.
+ *
+ * Two modes. Page mode counts through a known total. Cursor mode has no total —
+ * the log stream asks "what is newer/older than this id", which costs no
+ * COUNT(*) — so it reports how many rows are loaded and offers to load more.
+ */
+export default function Pagination({
+  page, pages, total, perPage, onChange, version, latestRelease,
+  cursorMode = false, loadedCount = 0, hasMore = false, loadingOlder = false, onLoadOlder,
+}) {
   const start = (page - 1) * perPage + 1
   const end = Math.min(page * perPage, total)
   const outdated = latestRelease && isNewerVersion(latestRelease.tag, version)
@@ -12,7 +23,13 @@ export default function Pagination({ page, pages, total, perPage, onChange, vers
     <>
       <div className="flex items-center justify-between px-3 py-2 border-t border-gray-800">
         <span className="text-[11px] text-gray-400">
-          {total > 0 ? `${formatNumber(start)}–${formatNumber(end)} of ${formatNumber(total)}` : 'No results'}
+          {cursorMode
+            ? (loadedCount > 0
+                ? `${formatNumber(loadedCount)} loaded${hasMore ? ' · more below' : ''}`
+                : 'No results')
+            : (total > 0
+                ? `${formatNumber(start)}–${formatNumber(end)} of ${formatNumber(total)}`
+                : 'No results')}
         </span>
         {version && (
           <div className="flex items-center gap-1.5">
@@ -38,6 +55,21 @@ export default function Pagination({ page, pages, total, perPage, onChange, vers
             )}
           </div>
         )}
+        {cursorMode ? (
+          <div className="flex items-center gap-1">
+            {hasMore ? (
+              <button
+                onClick={onLoadOlder}
+                disabled={loadingOlder}
+                className="px-3 py-1 text-xs text-gray-400 hover:text-gray-200 disabled:text-gray-700 disabled:cursor-not-allowed"
+              >
+                {loadingOlder ? 'Loading…' : 'Load older'}
+              </button>
+            ) : (
+              <span className="px-3 py-1 text-xs text-gray-600">End of results</span>
+            )}
+          </div>
+        ) : (
         <div className="flex items-center gap-1">
           <button
             disabled={page <= 1}
@@ -71,6 +103,7 @@ export default function Pagination({ page, pages, total, perPage, onChange, vers
             »»
           </button>
         </div>
+        )}
       </div>
 
       {showNotes && latestRelease && (

@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
-import { fetchLogs, fetchLog, getExportUrl, fetchLogCountsByType } from '../api'
+import { fetchLog, getExportUrl, fetchLogCountsByType } from '../api'
+import { useLogWindow } from '../hooks/useLogWindow'
+import { mergeDetail } from '../logWindow'
 import { TR_KEY } from '../utils'
 import FilterBar from './FilterBar'
 import LogTable from './LogTable'
@@ -24,6 +26,7 @@ const DEFAULT_FILTERS = {
   time_from: null,
   time_to: null,
   page: 1,
+  // Kept for the CSV export URL; the log window sizes its own pages.
   per_page: 50,
   sort: 'timestamp',
   order: 'desc',
@@ -73,13 +76,9 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
     }
     return restored
   })
-  const [data, setData] = useState({ data: [], total: 0, page: 1, pages: 0 })
-  const [loading, setLoading] = useState(true)
   const [autoRefresh, setAutoRefresh] = useState(true)
-  const [lastUpdate, setLastUpdate] = useState(null)
   const [expandedId, setExpandedId] = useState(null)
   const [detailedLog, setDetailedLog] = useState(null)
-  const [pendingCount, setPendingCount] = useState(0)
   const [hiddenColumns, setHiddenColumns] = useState(() => {
     try {
       const saved = localStorage.getItem(COLUMNS_STORAGE_KEY)
@@ -89,10 +88,16 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
   })
   const [showColumnsMenu, setShowColumnsMenu] = useState(false)
   const columnsMenuRef = useRef(null)
-  const filtersRef = useRef(filters)
-  filtersRef.current = filters
-  const pendingRef = useRef(null)
   const scrollRef = useRef(null)
+
+  // Live tailing is suspended while a row is expanded: prepending rows above an
+  // open detail panel moves it out from under the reader.
+  const isRefreshing = autoRefresh && expandedId === null
+
+  const {
+    rows, loading, loadingOlder, hasMore, pendingCount, lastUpdate,
+    reload, loadOlder, resume, setRows,
+  } = useLogWindow(filters, { enabled: isRefreshing, scrollRef })
   const [showScrollTop, setShowScrollTop] = useState(false)
   const [drillContext, setDrillContext] = useState(null)
 
@@ -195,53 +200,27 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
     return () => document.removeEventListener('mousedown', handler)
   }, [showColumnsMenu])
 
-  // Effective auto-refresh: paused when a row is expanded
-  const isRefreshing = autoRefresh && expandedId === null
-
   // Notify parent of pause state changes
   useEffect(() => { onPauseChange?.(!isRefreshing) }, [isRefreshing, onPauseChange])
-
-  // When paused (manually or by expanding a row), silently check for new logs count
-  useEffect(() => {
-    if (pendingRef.current) clearInterval(pendingRef.current)
-    if (!isRefreshing && filters.page === 1) {
-      pendingRef.current = setInterval(async () => {
-        try {
-          const qs = new URLSearchParams()
-          for (const [k, v] of Object.entries(filters)) {
-            if (v !== null && v !== undefined && v !== '') qs.set(k, v)
-          }
-          qs.set('per_page', '1')
-          const result = await fetchLogs(Object.fromEntries(qs))
-          const diff = result.total - data.total
-          if (diff > 0) setPendingCount(diff)
-        } catch {}
-      }, 5000)
-    }
-    return () => { if (pendingRef.current) clearInterval(pendingRef.current) }
-  }, [isRefreshing, filters, data.total])
 
   // Fetch detail data when a row is expanded
   useEffect(() => {
     if (expandedId === null) { setDetailedLog(null); return }
     let cancelled = false
     fetchLog(expandedId)
-      .then(detail => { if (!cancelled) setDetailedLog(detail) })
+      .then(detail => {
+        if (cancelled) return
+        setDetailedLog(detail)
+        // Fold the enrichment into the window too, so it survives rows arriving
+        // above it — the row object is no longer replaced on every refresh.
+        setRows(current => mergeDetail(current, detail))
+      })
       .catch(() => { if (!cancelled) setDetailedLog(null) })
     return () => { cancelled = true }
-  }, [expandedId])
+  }, [expandedId, setRows])
 
-  // Auto-resume: when row is collapsed, refresh immediately
   const handleToggleExpand = (id) => {
-    if (expandedId === id) {
-      setExpandedId(null)
-      setPendingCount(0)
-      // Refresh silently on collapse — no skeleton so the user keeps their place
-      load(filters, { background: true })
-    } else {
-      setExpandedId(id)
-      setPendingCount(0)
-    }
+    setExpandedId(current => (current === id ? null : id))
   }
 
   // Show scroll-to-top button when scrolled down
@@ -253,47 +232,14 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
     return () => el.removeEventListener('scroll', handleScroll)
   }, [])
 
-  // Stable load function — reads filters from ref to avoid effect cascades
-  const load = useCallback(async (f, { background } = {}) => {
-    try {
-      if (!background) setLoading(true)
-      const result = await fetchLogs(f || filtersRef.current)
-      setData(result)
-      setLastUpdate(new Date())
-    } catch (err) {
-      console.error('Failed to fetch logs:', err)
-    } finally {
-      if (!background) setLoading(false)
-    }
-  }, [])
-
-  // Load on filter change
-  useEffect(() => {
-    load(filters)
-  }, [filters, load])
-
-  // Auto-refresh every 5s when on page 1 and no row expanded
-  useEffect(() => {
-    if (!isRefreshing || filters.page !== 1) return
-    const id = setInterval(() => load(null, { background: true }), 5000)
-    return () => clearInterval(id)
-  }, [isRefreshing, filters.page, load])
-
   const handleFilterChange = (newFilters) => {
     setExpandedId(null)
-    setPendingCount(0)
     setFilters({ ...newFilters, page: 1 })
     // Persist time range within this session (shared across views via sessionStorage)
     try {
       if (newFilters.time_range) sessionStorage.setItem(TR_KEY, newFilters.time_range)
       else sessionStorage.removeItem(TR_KEY)
     } catch (e) { /* private browsing */ }
-  }
-
-  const handlePageChange = (page) => {
-    setExpandedId(null)
-    setPendingCount(0)
-    setFilters(f => ({ ...f, page }))
   }
 
   return (
@@ -314,7 +260,7 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
       <div className="flex items-center justify-between px-4 py-1.5 border-b border-gray-800/50 bg-gray-950">
         <div className="flex items-center gap-3">
           <button
-            onClick={() => { setAutoRefresh(!autoRefresh); setPendingCount(0) }}
+            onClick={() => setAutoRefresh(v => !v)}
             className={`flex items-center gap-1.5 text-[11px] transition-colors ${
               isRefreshing ? 'text-emerald-400' : 'text-amber-400'
             }`}
@@ -324,7 +270,7 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
           </button>
           {pendingCount > 0 && (
             <button
-              onClick={() => { setExpandedId(null); setPendingCount(0); load(filters) }}
+              onClick={() => { setExpandedId(null); resume() }}
               className="text-[11px] text-amber-400 hover:text-amber-300 transition-colors"
             >
               {pendingCount} new log{pendingCount !== 1 ? 's' : ''} ↻
@@ -380,7 +326,7 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
             })()}
           </div>
           <button
-            onClick={() => load(filters)}
+            onClick={reload}
             className="text-[11px] text-gray-400 hover:text-gray-200 transition-colors"
           >
             ↻ Refresh
@@ -397,7 +343,7 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
       {/* Log table */}
       <div className="flex-1 relative overflow-hidden">
         <div className="h-full overflow-auto" ref={scrollRef}>
-          <LogTable logs={data.data} loading={loading} expandedId={expandedId} detailedLog={detailedLog} onToggleExpand={handleToggleExpand} hiddenColumns={hiddenColumns} uiSettings={uiSettings} />
+          <LogTable logs={rows} loading={loading} expandedId={expandedId} detailedLog={detailedLog} onToggleExpand={handleToggleExpand} hiddenColumns={hiddenColumns} uiSettings={uiSettings} />
         </div>
         {showScrollTop && (
           <button
@@ -414,13 +360,13 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
 
       {/* Pagination */}
       <Pagination
-        page={data.page}
-        pages={data.pages}
-        total={data.total}
-        perPage={filters.per_page}
-        onChange={handlePageChange}
         version={version}
         latestRelease={latestRelease}
+        cursorMode
+        loadedCount={rows.length}
+        hasMore={hasMore}
+        loadingOlder={loadingOlder}
+        onLoadOlder={loadOlder}
       />
     </div>
   )
