@@ -71,19 +71,12 @@ export default function FilterBar({ filters, onChange, maxFilterDays, prefetched
     isInternalChange.current = true
     onChange(f)
   }, [onChange])
+  // The search box is the only input holding local state now; the panel builds
+  // its own draft when it opens, and the chips read straight from filters.
   useEffect(() => {
     if (isInternalChange.current) { isInternalChange.current = false; return }
-    setIpSearch(filters.ip || '')
-    setRuleSearch(filters.rule_name || '')
     setTextSearch(filters.search || '')
-    setCountrySearch(filters.country || '')
-    setAsnSearch(filters.asn || '')
-    setDstPortSearch(filters.dst_port ?? '')
-    setSrcPortSearch(filters.src_port ?? '')
-    setSelectedServices(filters.service ? filters.service.split(',') : [])
-    setSelectedInterfaces(filters.interface ? filters.interface.split(',') : [])
-    setSelectedProtocols(filters.protocol ? filters.protocol.split(',') : [])
-  }, [filters.ip, filters.rule_name, filters.search, filters.country, filters.asn, filters.dst_port, filters.src_port, filters.service, filters.interface, filters.protocol]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [filters.search])
 
   // Load services for autocomplete
   useEffect(() => {
@@ -213,7 +206,9 @@ export default function FilterBar({ filters, onChange, maxFilterDays, prefetched
         aria-expanded={filtersExpanded}
         aria-controls="log-filters-panel"
       >
-        <span>Filters{activeFilterCount > 0 ? ` (${activeFilterCount})` : ''}</span>
+        {/* Distinct from the panel button below, which opens the filter form —
+            this one just expands the bar on a narrow screen. */}
+        <span>Filters &amp; search{activeFilterCount > 0 ? ` (${activeFilterCount})` : ''}</span>
         <svg className={`w-3.5 h-3.5 transition-transform ${filtersExpanded ? 'rotate-180' : ''}`} viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" focusable="false">
           <path fillRule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.168l3.71-3.938a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clipRule="evenodd" />
         </svg>
