@@ -116,7 +116,17 @@ msg "Config:      $ENV_FILE"
 
 export DEBIAN_FRONTEND=noninteractive
 
+# The container image sets LANG=en_US.UTF-8 without generating it, so every apt
+# invocation and every Perl maintainer script prints three lines of complaint.
+# C.UTF-8 is built in, needs no locale-gen, and is UTF-8 — which the database
+# also needs.
 msg "Installing system packages..."
+if ! locale -a 2>/dev/null | grep -qiE '^(C\.utf-?8)$'; then
+    warn "C.UTF-8 is unavailable; locale warnings from apt are expected."
+else
+    update-locale LANG=C.UTF-8 LC_ALL= >/dev/null 2>&1 || true
+fi
+export LANG=C.UTF-8 LC_ALL=C.UTF-8
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends \
     ca-certificates curl gnupg tzdata rsync procps \
@@ -191,6 +201,26 @@ ok "Python dependencies installed."
 
 # ── UI build ─────────────────────────────────────────────────────────────────
 
+# Rebuilding takes about a minute — installing Node, an npm ci and a Vite
+# build — and produces byte-identical output when nothing under ui/ changed.
+# The stamp is a hash of the sources, so an unchanged tree skips all of it and
+# a changed one cannot be missed.
+UI_STAMP="$APP_DIR/static/.source-hash"
+UI_HASH=$(
+    find "$SRC_DIR/ui" -type f \
+        -not -path '*/node_modules/*' -not -path '*/dist/*' \
+        -print0 2>/dev/null | sort -z | xargs -0 sha256sum 2>/dev/null | sha256sum | cut -d' ' -f1
+)
+
+if [ -n "$UI_HASH" ] && [ -f "$UI_STAMP" ] && [ "$(cat "$UI_STAMP")" = "$UI_HASH" ] \
+   && [ -f "$APP_DIR/static/index.html" ]; then
+    ok "UI is current — skipping the rebuild (touch a file under ui/ to force it)."
+    SKIP_UI_BUILD=1
+else
+    SKIP_UI_BUILD=0
+fi
+
+if [ "$SKIP_UI_BUILD" = "0" ]; then
 msg "Building the React UI (this takes a few minutes)..."
 if ! command -v node >/dev/null 2>&1 || [ "$(node -v | sed 's/v\([0-9]*\).*/\1/')" -lt "$NODE_MAJOR" ]; then
     msg "Installing Node.js ${NODE_MAJOR} from NodeSource..."
@@ -230,6 +260,10 @@ if [ "$NODE_INSTALLED_HERE" = "1" ] && [ "$KEEP_NODE" = "0" ]; then
     rm -f /etc/apt/sources.list.d/nodesource.list
     apt-get update -qq
 fi
+
+# Written only after the build succeeded, so a failed one is retried next time.
+[ -n "$UI_HASH" ] && printf '%s' "$UI_HASH" > "$UI_STAMP"
+fi  # end SKIP_UI_BUILD
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
@@ -385,14 +419,13 @@ EOF
     DB_ENCODING=$(su - postgres -c "psql -tAc \"SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname='${DB_NAME_LOCAL}'\"")
     if [ "$DB_ENCODING" != "UTF8" ]; then
         warn "Database '${DB_NAME_LOCAL}' has encoding ${DB_ENCODING}, not UTF8."
-        warn "Non-ASCII names (VLANs, devices, hostnames) will fail to insert."
-        warn "Encoding is fixed at creation time. To convert, dump and reload:"
-        warn "    systemctl stop uip-api uip-receiver"
-        warn "    sudo -u postgres pg_dump -Fc ${DB_NAME_LOCAL} > /root/uip.dump"
-        warn "    sudo -u postgres dropdb ${DB_NAME_LOCAL}"
-        warn "    sudo -u postgres psql -c \"CREATE DATABASE ${DB_NAME_LOCAL} OWNER ${DB_USER_LOCAL} ENCODING 'UTF8' LC_COLLATE 'C.UTF-8' LC_CTYPE 'C.UTF-8' TEMPLATE template0;\""
-        warn "    sudo -u postgres pg_restore -d ${DB_NAME_LOCAL} /root/uip.dump"
-        warn "    then re-run this installer"
+        warn "Non-ASCII names fail to insert — one VLAN called 'Gaeste' aborts the"
+        warn "whole UniFi client sync, so no device names are stored at all."
+        warn "Encoding is fixed at creation, so converting means dump, recreate,"
+        warn "restore. It needs the services stopped and keeps the dump afterwards:"
+        warn "    systemctl stop uip-receiver uip-api"
+        warn "    ${APP_DIR}/venv/bin/python ${APP_DIR}/migrate_schema.py --fix-encoding"
+        warn "    systemctl start uip-receiver uip-api"
     fi
 
     # Privileges are re-applied on every run, not just on a fresh database.

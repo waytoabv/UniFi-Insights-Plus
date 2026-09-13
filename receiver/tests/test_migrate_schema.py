@@ -196,3 +196,66 @@ class TestRepairPath:
         """The index rename is skipped when the old table is already gone."""
         executed = _executed_sql(m.repair)
         assert any("to_regclass('logs_old')" in q for q in executed)
+
+
+class TestSequencePositionCheck:
+    """A sequence sitting exactly at max(id) is correct, not broken.
+
+    last_value is the value nextval handed out last, so the next one is
+    last_value + 1. Treating equality as a fault made the repair fire on every
+    deploy and write a setval that changed nothing — noise that would hide a
+    real collision.
+    """
+
+    def test_equality_is_not_a_fault(self):
+        source = inspect.getsource(m.repair)
+        assert 'seq_value < high' in source or 'last_value < ' in source, \
+            "a sequence at max(id) hands out max+1 next, which is correct"
+
+    def test_an_uncalled_sequence_is_handled(self):
+        """A fresh sequence returns its start value, so equality *is* a fault
+        there — is_called distinguishes the two."""
+        executed = _executed_sql(m.repair)
+        assert any('is_called' in q for q in executed)
+
+
+class TestEncodingConversion:
+    """Converting SQL_ASCII to UTF8 means dropping and recreating the database,
+    so the order of operations is the whole safety story."""
+
+    def test_it_refuses_while_something_is_connected(self):
+        source = inspect.getsource(m.convert_encoding)
+        assert 'pg_stat_activity' in source
+        assert 'Stop uip-receiver' in source
+
+    def test_it_does_nothing_when_already_utf8(self):
+        source = inspect.getsource(m.convert_encoding)
+        assert "already UTF8" in source
+
+    def test_it_dumps_before_dropping(self):
+        source = inspect.getsource(m.convert_encoding)
+        assert source.index('pg_dump') < source.index('DROP DATABASE')
+
+    def test_it_checks_the_dump_is_not_empty_before_dropping(self):
+        """A pg_dump that wrote nothing must not be followed by a DROP."""
+        source = inspect.getsource(m.convert_encoding)
+        assert source.index('refusing to drop') < source.index('DROP DATABASE')
+
+    def test_the_dump_is_a_file_not_a_pipe(self):
+        """Piping dump into restore leaves nothing to recover from if the
+        restore fails halfway."""
+        source = inspect.getsource(m.convert_encoding)
+        assert 'mkstemp' in source
+
+    def test_the_dump_is_kept_after_success(self):
+        source = inspect.getsource(m.convert_encoding)
+        assert 'delete it once' in source
+
+    def test_the_new_database_is_created_from_template0(self):
+        """A database may only differ in encoding from its template when copied
+        from template0."""
+        assert 'TEMPLATE template0' in inspect.getsource(m.convert_encoding)
+
+    def test_it_honours_dry_run(self):
+        source = inspect.getsource(m.convert_encoding)
+        assert 'if dry_run:' in source

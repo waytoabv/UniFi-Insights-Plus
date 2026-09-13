@@ -233,6 +233,98 @@ def write_cursor(cur, value: int):
     )
 
 
+def convert_encoding(conn_params, dry_run=False) -> int:
+    """Rebuild the database as UTF8.
+
+    A container image carries no UTF-8 locale, so postgresql-common initialises
+    the cluster as SQL_ASCII and a database created without an explicit encoding
+    inherits it. Every non-ASCII byte then fails to insert: a VLAN named "Gäste"
+    aborts the whole UniFi client upsert, so no device names are stored at all.
+
+    Encoding is fixed at creation, so the only route is dump, recreate, restore.
+    Done here rather than left as four commands in a warning, because getting
+    the order wrong loses the data.
+    """
+    import os
+    import subprocess
+    import tempfile
+
+    dbname = conn_params.get('dbname', 'unifi_logs')
+    owner = conn_params.get('user', 'unifi')
+
+    admin = dict(conn_params, dbname='postgres')
+    probe = psycopg2.connect(**admin)
+    probe.autocommit = True
+    with probe.cursor() as cur:
+        cur.execute("SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname = %s",
+                    [dbname])
+        row = cur.fetchone()
+        if not row:
+            logger.error("Database %r does not exist.", dbname)
+            return 1
+        if row[0] == 'UTF8':
+            logger.info("Database is already UTF8 — nothing to do.")
+            probe.close()
+            return 0
+
+        cur.execute("SELECT count(*) FROM pg_stat_activity "
+                    "WHERE datname = %s AND pid <> pg_backend_pid()", [dbname])
+        busy = cur.fetchone()[0]
+
+    if busy:
+        logger.error("%d other session(s) are connected to %s. Stop uip-receiver and "
+                     "uip-api first — the rebuild drops and recreates the database.",
+                     busy, dbname)
+        probe.close()
+        return 1
+
+    logger.warning("Database %s is %s; rebuilding it as UTF8.", dbname, row[0])
+    if dry_run:
+        logger.info("would dump, drop, recreate as UTF8 and restore")
+        probe.close()
+        return 0
+
+    env = dict(os.environ)
+    if conn_params.get('password'):
+        env['PGPASSWORD'] = conn_params['password']
+    base = ['-h', str(conn_params.get('host', '127.0.0.1')),
+            '-p', str(conn_params.get('port', 5432)),
+            '-U', str(conn_params.get('user', 'unifi'))]
+
+    # Kept on disk rather than piped: a failure mid-restore must leave something
+    # to restore from.
+    handle, dump_path = tempfile.mkstemp(prefix='uip-encoding-', suffix='.dump')
+    os.close(handle)
+    try:
+        logger.info("Dumping to %s ...", dump_path)
+        subprocess.run(['pg_dump', *base, '-Fc', '-f', dump_path, dbname],
+                       check=True, env=env)
+        size = os.path.getsize(dump_path)
+        if size < 1024:
+            logger.error("Dump is only %d bytes — refusing to drop the database.", size)
+            return 1
+        logger.info("Dump complete (%.1f MB). Recreating as UTF8...", size / 1048576)
+
+        with probe.cursor() as cur:
+            cur.execute(f'DROP DATABASE "{dbname}"')
+            cur.execute(
+                f'CREATE DATABASE "{dbname}" OWNER "{owner}" '
+                f"ENCODING 'UTF8' LC_COLLATE 'C.UTF-8' LC_CTYPE 'C.UTF-8' TEMPLATE template0")
+
+        logger.info("Restoring...")
+        subprocess.run(['pg_restore', *base, '-d', dbname, '--no-owner', dump_path],
+                       check=True, env=env)
+        logger.info("Database is now UTF8. The dump is kept at %s — delete it once "
+                    "the application looks right.", dump_path)
+        return 0
+    except subprocess.CalledProcessError as exc:
+        logger.error("Conversion failed at %s. The dump is at %s and can be restored "
+                     "by hand.", exc.cmd[0], dump_path)
+        return 1
+    finally:
+        probe.close()
+
+
 def repair(conn, cur, dry_run=False) -> int:
     """Check and fix what an earlier run of this script may have left undone.
 
@@ -299,11 +391,16 @@ def repair(conn, cur, dry_run=False) -> int:
             fixed.append("sequence ownership")
 
     # A sequence behind max(id) makes the next insert collide.
-    cur.execute("SELECT last_value FROM logs_id_seq")
-    seq_value = cur.fetchone()[0]
+    #
+    # last_value is what nextval handed out last, so a sequence sitting exactly
+    # at max(id) yields max+1 next and is correct — equality is only a fault on
+    # a sequence that has never been called, where nextval returns last_value
+    # itself. is_called tells the two apart.
+    cur.execute("SELECT last_value, is_called FROM logs_id_seq")
+    seq_value, is_called = cur.fetchone()
     cur.execute("SELECT COALESCE(MAX(id), 0) FROM logs")
     high = cur.fetchone()[0]
-    if seq_value <= high:
+    if seq_value < high or (not is_called and seq_value <= high):
         logger.warning("logs_id_seq is at %s, highest id is %s.", f"{seq_value:,}", f"{high:,}")
         if dry_run:
             logger.info("would advance it past the highest id")
@@ -328,9 +425,16 @@ def main():
     ap.add_argument('--dry-run', action='store_true',
                     help='report what would happen and exit without writing')
     ap.add_argument('--batch', type=int, default=50000, help='rows per copy batch')
+    ap.add_argument('--fix-encoding', action='store_true',
+                    help='rebuild the database as UTF8 (dump, recreate, restore)')
     args = ap.parse_args()
 
-    conn = psycopg2.connect(**build_conn_params())
+    conn_params = build_conn_params()
+
+    if args.fix_encoding:
+        return convert_encoding(conn_params, dry_run=args.dry_run)
+
+    conn = psycopg2.connect(**conn_params)
     conn.autocommit = False
     cur = conn.cursor()
 
@@ -490,9 +594,9 @@ def main():
                      owner[0] if owner else 'nothing')
         return 1
 
-    cur.execute("SELECT last_value FROM logs_id_seq")
-    seq_value = cur.fetchone()[0]
-    if seq_value <= max_id:
+    cur.execute("SELECT last_value, is_called FROM logs_id_seq")
+    seq_value, is_called = cur.fetchone()
+    if seq_value < max_id or (not is_called and seq_value <= max_id):
         logger.error("logs_id_seq is at %s but the highest id is %s — the next insert "
                      "would collide.", f"{seq_value:,}", f"{max_id:,}")
         return 1
