@@ -53,6 +53,8 @@ def get_logs(
     order: str = Query("desc", description="asc or desc"),
     page: int = Query(1, ge=1),
     per_page: int = Query(50, ge=1, le=200),
+    since: int = Query(0, ge=0, description="Cursor: only rows newer than this id"),
+    before_id: int = Query(0, ge=0, description="Cursor: only rows older than this id"),
 ):
     time_range, time_from, time_to = validate_time_params(time_range, time_from, time_to)
     where, params = build_log_query(
@@ -61,7 +63,13 @@ def get_logs(
         rule_name, country, threat_min, search, service,
         interface, vpn_only, asn=asn,
         dst_port=dst_port, src_port=src_port, protocol=protocol,
+        since=since, before_id=before_id,
     )
+
+    # A cursor request answers "what is newer/older than this id". It needs no
+    # total — the COUNT(*) below is a full scan of the filtered set, measured at
+    # 371 ms on 4.7M rows, and it ran on every poll — and no OFFSET.
+    cursor_mode = bool(since or before_id)
 
     # Whitelist sort columns
     allowed_sorts = {
@@ -76,15 +84,29 @@ def get_logs(
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Count total
-            cur.execute(f"SELECT COUNT(*) as total FROM logs WHERE {where}", params)
-            total = cur.fetchone()['total']
+            total = None
+            if not cursor_mode:
+                cur.execute(f"SELECT COUNT(*) as total FROM logs WHERE {where}", params)
+                total = cur.fetchone()['total']
+
+            # Cursor mode orders by id: at this ingest rate timestamps tie
+            # constantly, and a tie makes a cursor skip or repeat rows. One row
+            # beyond the page answers "is there more" without a count.
+            if cursor_mode:
+                window_sql = f"""SELECT * FROM logs WHERE {where}
+                                 ORDER BY id DESC LIMIT %s"""
+                window_params = params + [per_page + 1]
+                order_by = 'page.id DESC'
+            else:
+                window_sql = f"""SELECT * FROM logs WHERE {where}
+                                 ORDER BY {sort_col} {sort_dir} LIMIT %s OFFSET %s"""
+                window_params = params + [per_page, offset]
+                order_by = f'page.{sort_col} {sort_dir}'
 
             # Fetch page, enriching with live device names from unifi_clients + unifi_devices
             cur.execute(
                 f"""WITH page AS (
-                        SELECT * FROM logs WHERE {where}
-                        ORDER BY {sort_col} {sort_dir} LIMIT %s OFFSET %s
+                        {window_sql}
                     )
                     SELECT page.*,
                         {device_name_coalesce('c1', 'd1', 'src_device_name', 'sdn.name')},
@@ -96,21 +118,32 @@ def get_logs(
                     {device_name_client_lateral('page.dst_ip', 'c2')}
                     LEFT JOIN unifi_devices d1 ON d1.mac = page.mac_address
                     {device_name_device_lateral('page.dst_ip', 'd2')}
-                    ORDER BY page.{sort_col} {sort_dir}""",
-                params + [per_page, offset]
+                    ORDER BY {order_by}""",
+                window_params
             )
             rows = cur.fetchall()
+
+        # The extra row was only ever a probe for "is there more".
+        has_more = cursor_mode and len(rows) > per_page
+        if has_more:
+            rows = rows[:per_page]
 
         logs = [_serialize_log(row) for row in rows]
         _annotate_logs(logs)
 
         conn.commit()
+        ids = [log['id'] for log in logs if log.get('id') is not None]
         return {
             'data': logs,
             'total': total,
             'page': page,
             'per_page': per_page,
-            'pages': (total + per_page - 1) // per_page if per_page else 0,
+            'pages': (total + per_page - 1) // per_page if per_page and total is not None else 0,
+            # Window bounds, so the client can ask for what is newer or older
+            # without tracking page numbers that shift as rows arrive.
+            'newest_id': max(ids) if ids else None,
+            'oldest_id': min(ids) if ids else None,
+            'has_more': bool(has_more) if cursor_mode else (page * per_page < (total or 0)),
         }
     except Exception as e:
         conn.rollback()
@@ -362,8 +395,14 @@ def _serialize_log(row):
     log['interface_out'] = lk.interfaces.text_for(log.pop('iface_out_id', None))
     log['hostname'] = lk.device_names.text_for(log.pop('hostname_id', None))
 
+    # rules is keyed on (name, descr), so text_for returns a pair. Unpacking it
+    # blindly turns any unexpected shape into a 500 on the whole log stream.
     rule = lk.rules.text_for(log.pop('rule_id', None))
-    log['rule_name'], log['rule_desc'] = rule if rule else (None, None)
+    if isinstance(rule, (tuple, list)) and len(rule) == 2:
+        log['rule_name'], log['rule_desc'] = rule
+    else:
+        log['rule_name'] = rule if isinstance(rule, str) else None
+        log['rule_desc'] = None
 
     # service_name is no longer stored — it is a function of port and protocol.
     log['service_name'] = get_service_name(log.get('dst_port'), log.get('protocol'))

@@ -181,10 +181,25 @@ def build_log_query(
     dst_port: Optional[str] = None,
     src_port: Optional[str] = None,
     protocol: Optional[str] = None,
+    since: Optional[int] = None,
+    before_id: Optional[int] = None,
 ) -> tuple[str, list]:
-    """Build WHERE clause and params from filters."""
+    """Build WHERE clause and params from filters.
+
+    `since` and `before_id` are id cursors, not filters: they bound the window
+    rather than describe the rows. A request carrying either needs no COUNT(*)
+    and no OFFSET, which is what makes the log stream cheap to keep open.
+    """
     conditions = []
     params = []
+
+    # 0 means "no cursor yet" — the UI sends it before it has seen a row.
+    if since:
+        conditions.append("id > %s")
+        params.append(int(since))
+    if before_id:
+        conditions.append("id < %s")
+        params.append(int(before_id))
 
     if log_type:
         types = [t.strip() for t in log_type.split(',')]
