@@ -77,7 +77,7 @@ def _query_top_blocked_ips(cur, cutoff, exclude_ips):
         "SELECT host(src_ip) as ip, COUNT(*) as count, "
         "MAX(geo_country) as country, MAX(asn_name) as asn, "
         "MAX(threat_score) as threat_score "
-        "FROM logs "
+        "FROM logs_text "
         "WHERE timestamp >= %s AND rule_action = 'block' AND src_ip IS NOT NULL "
         "AND host(src_ip) != ALL(%s) "
         "AND is_public_inet(src_ip) "
@@ -92,7 +92,7 @@ def _query_top_blocked_internal_ips(cur, cutoff):
     cur.execute(
         "WITH top_ips AS ("
         "  SELECT src_ip, host(src_ip) as ip, COUNT(*) as count "
-        "  FROM logs "
+        "  FROM logs_text "
         "  WHERE timestamp >= %s AND rule_action = 'block' AND src_ip IS NOT NULL "
         "  AND NOT is_public_inet(src_ip) "
         "  GROUP BY src_ip ORDER BY count DESC LIMIT 10"
@@ -115,7 +115,7 @@ def _query_top_threat_ips(cur, cutoff, exclude_ips):
         "MAX(l.threat_score) as threat_score, "
         "COALESCE(MAX(l.threat_categories), MAX(t.threat_categories)) as threat_categories, "
         "MAX(l.timestamp) as last_seen "
-        "FROM logs l "
+        "FROM logs_text l "
         "LEFT JOIN ip_threats t ON l.src_ip = t.ip "
         "WHERE l.timestamp >= %s AND l.threat_score > 50 AND l.src_ip IS NOT NULL "
         "AND host(l.src_ip) != ALL(%s) "
@@ -136,7 +136,7 @@ def _query_top_allowed_destinations(cur, cutoff, exclude_ips):
     cur.execute(
         "SELECT host(dst_ip) as ip, COUNT(*) as count, "
         "MAX(geo_country) as country, MAX(asn_name) as asn "
-        "FROM logs "
+        "FROM logs_text "
         "WHERE timestamp >= %s AND rule_action = 'allow' AND dst_ip IS NOT NULL "
         "AND host(dst_ip) != ALL(%s) "
         "AND is_public_inet(dst_ip) "
@@ -149,7 +149,7 @@ def _query_top_allowed_destinations(cur, cutoff, exclude_ips):
 def _query_top_dns(cur, cutoff):
     """Top DNS queries."""
     cur.execute(
-        "SELECT dns_query, COUNT(*) as count FROM logs "
+        "SELECT dns_query, COUNT(*) as count FROM logs_text "
         "WHERE timestamp >= %s AND log_type = 'dns' AND dns_query IS NOT NULL "
         "GROUP BY dns_query ORDER BY count DESC LIMIT 10",
         [cutoff]
@@ -165,7 +165,7 @@ def _query_top_active_internal_ips(cur, cutoff):
     cur.execute(
         "WITH top_ips AS ("
         "  SELECT src_ip, host(src_ip) as ip, COUNT(*) as count "
-        "  FROM logs "
+        "  FROM logs_text "
         "  WHERE timestamp >= %s AND rule_action = 'allow' AND src_ip IS NOT NULL "
         "  AND NOT is_public_inet(src_ip) "
         + gw_filter +
@@ -195,7 +195,7 @@ def _query_logs_over_time(cur, cutoff, bucket):
     """Logs over time with adaptive bucketing."""
     cur.execute(
         f"SELECT date_trunc('{bucket}', timestamp) as period, COUNT(*) as count "
-        "FROM logs WHERE timestamp >= %s "
+        "FROM logs_text WHERE timestamp >= %s "
         "GROUP BY period ORDER BY period",
         [cutoff]
     )
@@ -210,7 +210,7 @@ def _query_traffic_by_action(cur, cutoff, bucket):
     cur.execute(
         f"SELECT date_trunc('{bucket}', timestamp) as period, "
         "rule_action, COUNT(*) as count "
-        "FROM logs WHERE timestamp >= %s AND log_type = 'firewall' "
+        "FROM logs_text WHERE timestamp >= %s AND log_type = 'firewall' "
         "AND rule_action IS NOT NULL "
         "GROUP BY period, rule_action ORDER BY period",
         [cutoff]
@@ -244,12 +244,12 @@ def get_stats(
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             # Total logs
-            cur.execute("SELECT COUNT(*) as total FROM logs WHERE timestamp >= %s", [cutoff])
+            cur.execute("SELECT COUNT(*) as total FROM logs_text WHERE timestamp >= %s", [cutoff])
             total = cur.fetchone()['total']
 
             # By type
             cur.execute(
-                "SELECT log_type, COUNT(*) as count FROM logs "
+                "SELECT log_type, COUNT(*) as count FROM logs_text "
                 "WHERE timestamp >= %s GROUP BY log_type ORDER BY count DESC",
                 [cutoff]
             )
@@ -257,7 +257,7 @@ def get_stats(
 
             # Blocked count
             cur.execute(
-                "SELECT COUNT(*) as count FROM logs "
+                "SELECT COUNT(*) as count FROM logs_text "
                 "WHERE timestamp >= %s AND rule_action = 'block'",
                 [cutoff]
             )
@@ -265,7 +265,7 @@ def get_stats(
 
             # Threat count (score > 50)
             cur.execute(
-                "SELECT COUNT(*) as count FROM logs "
+                "SELECT COUNT(*) as count FROM logs_text "
                 "WHERE timestamp >= %s AND threat_score > 50",
                 [cutoff]
             )
@@ -273,7 +273,7 @@ def get_stats(
 
             # Top blocked countries
             cur.execute(
-                "SELECT geo_country as country, COUNT(*) as count FROM logs "
+                "SELECT geo_country as country, COUNT(*) as count FROM logs_text "
                 "WHERE timestamp >= %s AND rule_action = 'block' AND geo_country IS NOT NULL "
                 "GROUP BY geo_country ORDER BY count DESC LIMIT 10",
                 [cutoff]
@@ -290,7 +290,7 @@ def get_stats(
 
             # Direction breakdown
             cur.execute(
-                "SELECT direction, COUNT(*) as count FROM logs "
+                "SELECT direction, COUNT(*) as count FROM logs_text "
                 "WHERE timestamp >= %s AND direction IS NOT NULL "
                 "GROUP BY direction ORDER BY count DESC",
                 [cutoff]
@@ -301,7 +301,7 @@ def get_stats(
 
             # Top blocked services
             cur.execute(
-                "SELECT service_name, COUNT(*) as count FROM logs "
+                "SELECT service_name, COUNT(*) as count FROM logs_text "
                 "WHERE timestamp >= %s AND rule_action = 'block' AND service_name IS NOT NULL "
                 "GROUP BY service_name ORDER BY count DESC LIMIT 10",
                 [cutoff]
@@ -310,7 +310,7 @@ def get_stats(
 
             # Allowed count
             cur.execute(
-                "SELECT COUNT(*) as count FROM logs "
+                "SELECT COUNT(*) as count FROM logs_text "
                 "WHERE timestamp >= %s AND log_type = 'firewall' AND rule_action = 'allow'",
                 [cutoff]
             )
@@ -320,7 +320,7 @@ def get_stats(
 
             # Top allowed countries (outbound destinations)
             cur.execute(
-                "SELECT geo_country as country, COUNT(*) as count FROM logs "
+                "SELECT geo_country as country, COUNT(*) as count FROM logs_text "
                 "WHERE timestamp >= %s AND rule_action = 'allow' "
                 "AND geo_country IS NOT NULL AND direction = 'outbound' "
                 "GROUP BY geo_country ORDER BY count DESC LIMIT 10",
@@ -330,7 +330,7 @@ def get_stats(
 
             # Top allowed services
             cur.execute(
-                "SELECT service_name, COUNT(*) as count FROM logs "
+                "SELECT service_name, COUNT(*) as count FROM logs_text "
                 "WHERE timestamp >= %s AND rule_action = 'allow' AND service_name IS NOT NULL "
                 "GROUP BY service_name ORDER BY count DESC LIMIT 10",
                 [cutoff]
@@ -393,13 +393,13 @@ def get_stats_overview(
                     COUNT(*) FILTER (WHERE log_type = 'firewall' AND rule_action = 'allow') AS allowed,
                     COUNT(*) FILTER (WHERE rule_action = 'block') AS blocked,
                     COUNT(*) FILTER (WHERE threat_score > 50) AS threats
-                FROM logs WHERE timestamp >= %s
+                FROM logs_text WHERE timestamp >= %s
             """, [cutoff])
             row = cur.fetchone()
 
             cur.execute("""
                 SELECT direction, COUNT(*) AS count
-                FROM logs
+                FROM logs_text
                 WHERE timestamp >= %s AND direction IS NOT NULL
                 GROUP BY direction ORDER BY count DESC
             """, [cutoff])
@@ -407,7 +407,7 @@ def get_stats_overview(
 
             cur.execute("""
                 SELECT log_type, COUNT(*) AS count
-                FROM logs
+                FROM logs_text
                 WHERE timestamp >= %s
                 GROUP BY log_type ORDER BY count DESC
             """, [cutoff])
@@ -448,7 +448,7 @@ def get_stats_tables(
 
             # --- Consolidated countries query (blocked + allowed) ---
             cur.execute(
-                "SELECT geo_country AS country, rule_action, COUNT(*) AS count FROM logs "
+                "SELECT geo_country AS country, rule_action, COUNT(*) AS count FROM logs_text "
                 "WHERE timestamp >= %s AND rule_action IN ('block', 'allow') "
                 "AND geo_country IS NOT NULL "
                 "AND (rule_action = 'block' OR direction = 'outbound') "
@@ -468,7 +468,7 @@ def get_stats_tables(
 
             # --- Consolidated services query (blocked + allowed) ---
             cur.execute(
-                "SELECT service_name, rule_action, COUNT(*) AS count FROM logs "
+                "SELECT service_name, rule_action, COUNT(*) AS count FROM logs_text "
                 "WHERE timestamp >= %s AND rule_action IN ('block', 'allow') "
                 "AND service_name IS NOT NULL "
                 "GROUP BY service_name, rule_action ORDER BY count DESC",
@@ -589,7 +589,7 @@ def get_ip_pairs(
             MAX(threat_score) AS max_threat_score,
             MAX(asn_name) AS asn_name,
             MAX(direction) AS direction
-        FROM logs
+        FROM logs_text
         WHERE {where}
           AND src_ip IS NOT NULL AND dst_ip IS NOT NULL
           AND dst_port IS NOT NULL AND protocol IS NOT NULL
@@ -670,7 +670,7 @@ def get_ip_pairs_csv(
         MODE() WITHIN GROUP (ORDER BY service_name) AS service,
         COUNT(*) FILTER (WHERE rule_action = 'allow') AS allow_count,
         COUNT(*) FILTER (WHERE rule_action = 'block') AS block_count
-    FROM logs
+    FROM logs_text
     WHERE {where}
       AND src_ip IS NOT NULL AND dst_ip IS NOT NULL
       AND dst_port IS NOT NULL AND protocol IS NOT NULL

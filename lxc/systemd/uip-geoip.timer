@@ -5,13 +5,6 @@ Documentation=https://insightsplus.dev/docs
 [Timer]
 # Equivalent to the image's cron entry: 0 7 * * 3,6
 OnCalendar=Wed,Sat *-*-* 07:00:00 UTC
-
-# Also run shortly after boot. Credentials are usually added to the environment
-# file after installation, and without this the databases would stay missing
-# until the next scheduled slot — up to three and a half days of no GeoIP.
-# geoipupdate sends a conditional request, so an already-current database costs
-# one round trip and no download.
-OnBootSec=3min
 # Catch up after the container was powered off at the scheduled time — cron would
 # simply have skipped the run.
 Persistent=true

@@ -72,13 +72,13 @@ def batch_threat_lookup(req: BatchThreatRequest):
                 f"""SELECT DISTINCT ON (combined_ip) combined_ip, rdns, asn_name
                     FROM (
                         SELECT host(src_ip) AS combined_ip, rdns, asn_name, timestamp
-                        FROM logs
+                        FROM logs_text
                         WHERE src_ip IN ({placeholders})
                           AND timestamp >= %s
                           AND (rdns IS NOT NULL OR asn_name IS NOT NULL)
                         UNION ALL
                         SELECT host(dst_ip) AS combined_ip, rdns, asn_name, timestamp
-                        FROM logs
+                        FROM logs_text
                         WHERE dst_ip IN ({placeholders})
                           AND timestamp >= %s
                           AND (rdns IS NOT NULL OR asn_name IS NOT NULL)
@@ -212,7 +212,7 @@ _GEO_SELECT = (
     "AVG(threat_score)::int as avg_score, "
     "COUNT(DISTINCT COALESCE(host(src_ip), host(dst_ip))) as unique_ips, "
     "(array_agg(id ORDER BY timestamp DESC))[1:50] as log_ids "
-    "FROM logs "
+    "FROM logs_text "
 )
 
 

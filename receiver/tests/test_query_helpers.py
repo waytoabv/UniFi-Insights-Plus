@@ -2,6 +2,8 @@
 
 import pytest
 
+import lookups
+
 from query_helpers import (
     _escape_like,
     _parse_negation,
@@ -121,6 +123,55 @@ class TestValidateTimeParams:
 
 # ── build_log_query ──────────────────────────────────────────────────────────
 
+class FakeLookupDB:
+    """Serves canned lookup rows; see tests/test_lookups.py for the contract."""
+
+    def __init__(self, tables):
+        self.tables = tables
+
+    def fetch_lookup(self, table, columns):
+        return list(self.tables.get(table, []))
+
+    def insert_lookup(self, table, columns, values):
+        rows = self.tables.setdefault(table, [])
+        new_id = len(rows) + 1
+        rows.append((new_id, *values))
+        return new_id
+
+
+@pytest.fixture(autouse=True)
+def _lookups():
+    """Bind lookup tables for the whole module.
+
+    build_log_query resolves text filters to ids through these, so the id
+    numbers the assertions below expect come from this fixture, not from a
+    live database.
+    """
+    import lookups as lookups_mod
+    from query_helpers import set_lookups
+
+    db = FakeLookupDB({
+        'rules': [
+            (1, 'LAN-to-WAN', 'allow established'),
+            (2, '[WAN_LOCAL]Allow All Traffic', None),
+            (3, 'IOT-block', 'drop all'),
+        ],
+        'interfaces': [(1, 'eth0'), (2, 'ppp0'), (3, 'wgsrv0'), (4, 'vti64')],
+        'device_names': [(1, 'apple-tv'), (2, 'nas')],
+        'protocols': [(1, 'tcp'), (2, 'udp'), (3, 'icmp')],
+    })
+
+    class Bundle:
+        rules = lookups_mod.LookupTable(db, 'rules', ('name', 'descr'))
+        interfaces = lookups_mod.LookupTable(db, 'interfaces', ('name',))
+        device_names = lookups_mod.LookupTable(db, 'device_names', ('name',))
+        protocols = lookups_mod.LookupTable(db, 'protocols', ('name',))
+
+    set_lookups(Bundle)
+    yield Bundle
+    set_lookups(None)
+
+
 class TestBuildLogQuery:
     def _build(self, **kw):
         defaults = dict(
@@ -142,15 +193,15 @@ class TestBuildLogQuery:
 
     def test_single_log_type(self):
         where, params = self._build(log_type='firewall')
-        assert 'log_type IN' in where
-        assert 'firewall' in params
+        assert 'log_type_id IN' in where
+        assert lookups.log_type_id('firewall') in params
 
     def test_multiple_log_types(self):
         where, params = self._build(log_type='firewall,dns')
         # 2 log_type placeholders + 1 time fallback
         assert where.count('%s') == 3
-        assert 'firewall' in params
-        assert 'dns' in params
+        assert lookups.log_type_id('firewall') in params
+        assert lookups.log_type_id('dns') in params
 
     def test_negated_ip(self):
         where, params = self._build(ip='!1.2.3.4')
@@ -163,29 +214,29 @@ class TestBuildLogQuery:
     def test_negated_rule_action(self):
         where, params = self._build(rule_action='!block')
         assert 'NOT IN' in where
-        assert 'block' in params
+        assert lookups.rule_action_id('block') in params
 
     def test_unknown_action_filter(self):
         where, params = self._build(rule_action='unknown')
-        assert 'rule_action IS NULL' in where
+        assert 'rule_action_id IS NULL' in where
         assert 'unknown' not in params
 
     def test_unknown_with_block_action_filter(self):
         where, params = self._build(rule_action='block,unknown')
-        assert 'rule_action IN' in where
-        assert 'rule_action IS NULL' in where
+        assert 'rule_action_id IN' in where
+        assert 'rule_action_id IS NULL' in where
         assert 'OR' in where
-        assert 'block' in params
+        assert lookups.rule_action_id('block') in params
 
     def test_negated_unknown_action_filter(self):
         where, params = self._build(rule_action='!unknown')
-        assert 'rule_action IS NOT NULL' in where
+        assert 'rule_action_id IS NOT NULL' in where
 
     def test_negated_unknown_with_block(self):
         where, params = self._build(rule_action='!block,unknown')
         assert 'NOT IN' in where
         assert 'IS NOT NULL' in where
-        assert 'block' in params
+        assert lookups.rule_action_id('block') in params
 
     def test_negated_country(self):
         where, params = self._build(country='!US,CN')
@@ -206,19 +257,29 @@ class TestBuildLogQuery:
 
     def test_negated_protocol(self):
         where, params = self._build(protocol='!tcp')
-        assert 'NOT IN' in where
-        assert 'tcp' in params
+        assert 'protocol_id NOT IN' in where
+        assert 1 in params  # id of 'tcp' in the fixture
+
+    def test_unknown_protocol_matches_nothing(self):
+        """A protocol never seen on the wire has no id, so a positive filter
+        for it must return no rows rather than every row."""
+        where, _ = self._build(protocol='sctp')
+        assert '1=0' in where
 
     def test_vpn_only(self):
         where, params = self._build(vpn_only=True)
-        assert 'interface_in LIKE' in where
+        assert 'iface_in_id IN' in where
+        assert 'iface_out_id IN' in where
+        # wgsrv0 and vti64 match VPN_INTERFACE_PREFIXES; eth0 and ppp0 do not.
+        assert 3 in params and 4 in params
+        assert 1 not in params and 2 not in params
 
     def test_combined_filters(self):
         where, params = self._build(
             log_type='firewall', direction='inbound', threat_min=50
         )
-        assert 'log_type IN' in where
-        assert 'direction IN' in where
+        assert 'log_type_id IN' in where
+        assert 'direction_id IN' in where
         assert 'threat_score >= %s' in where
 
 
@@ -412,3 +473,90 @@ class TestSanitizeCsvCell:
     def test_non_string_raises(self):
         with pytest.raises(TypeError):
             sanitize_csv_cell(42)
+
+
+# ── Free-text search ─────────────────────────────────────────────────────────
+
+class TestSearchCondition:
+    """The search box covers every displayed field, not just the raw line.
+
+    Replaces the previous `raw_log ILIKE`, which stopped matching once raw_log
+    was no longer stored for parsed rows, and which could never find anything
+    the parser derived.
+    """
+
+    def _build(self, **kw):
+        defaults = dict(
+            log_type=None, time_range=None, time_from=None, time_to=None,
+            src_ip=None, dst_ip=None, ip=None, direction=None,
+            rule_action=None, rule_name=None, country=None,
+            threat_min=None, search=None, service=None, interface=None,
+            dst_port=None, src_port=None, protocol=None, vpn_only=None,
+            asn=None,
+        )
+        defaults.update(kw)
+        return build_log_query(**defaults)
+
+    def test_covers_ip_columns(self):
+        where, _ = self._build(search='10.10.30')
+        assert 'src_ip::text ILIKE' in where
+        assert 'dst_ip::text ILIKE' in where
+
+    def test_covers_enrichment_columns(self):
+        where, _ = self._build(search='Google')
+        for column in ('rdns', 'geo_country', 'geo_city', 'asn_name'):
+            assert f'{column} ILIKE' in where
+
+    def test_covers_ports(self):
+        where, _ = self._build(search='443')
+        assert 'dst_port::text ILIKE' in where
+
+    def test_matches_rule_names_through_the_lookup(self):
+        where, params = self._build(search='IOT')
+        assert 'rule_id IN' in where
+        assert 3 in params  # IOT-block from the fixture
+
+    def test_matches_rule_descriptions_too(self):
+        """The description is displayed next to the name, so it is searchable."""
+        where, params = self._build(search='drop all')
+        assert 'rule_id IN' in where
+        assert 3 in params
+
+    def test_matches_device_names(self):
+        where, params = self._build(search='apple')
+        assert 'src_device_id IN' in where
+        assert 'dst_device_id IN' in where
+
+    def test_matches_protocol(self):
+        where, params = self._build(search='udp')
+        assert 'protocol_id IN' in where
+        assert 2 in params
+
+    def test_matches_action_words(self):
+        """Searching 'block' finds blocked traffic — the word the UI shows."""
+        where, params = self._build(search='block')
+        assert 'rule_action_id IN' in where
+        assert lookups.rule_action_id('block') in params
+
+    def test_matches_log_type_words(self):
+        where, params = self._build(search='firewall')
+        assert 'log_type_id IN' in where
+        assert lookups.log_type_id('firewall') in params
+
+    def test_unmatched_lookup_adds_no_clause(self):
+        """A term matching no rule must not widen the search to every rule."""
+        where, _ = self._build(search='zzzznotarule')
+        assert 'rule_id IN' not in where
+
+    def test_still_searches_raw_log(self):
+        """Unparsed lines keep their raw text — it is all they have."""
+        where, _ = self._build(search='anything')
+        assert 'raw_log ILIKE' in where
+
+    def test_negation_wraps_the_whole_clause(self):
+        where, _ = self._build(search='!tcp')
+        assert where.count('NOT (') == 1
+
+    def test_terms_are_escaped(self):
+        where, params = self._build(search='100%')
+        assert all('100\\%' in p for p in params if isinstance(p, str) and '100' in p)

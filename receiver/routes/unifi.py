@@ -557,38 +557,52 @@ def backfill_device_names(body: dict):
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            # src_device_name: MAC-based join (stable across DHCP changes)
+            # Device names are interned, so every name the clients table knows
+            # needs an id before the joins below can reference it.
+            cur.execute("""
+                INSERT INTO device_names (name)
+                SELECT DISTINCT COALESCE(device_name, hostname, oui)
+                FROM unifi_clients
+                WHERE COALESCE(device_name, hostname, oui) IS NOT NULL
+                ON CONFLICT DO NOTHING
+            """)
+
+            # src_device_id: MAC-based join (stable across DHCP changes)
             cur.execute("""
                 UPDATE logs
-                SET src_device_name = COALESCE(c.device_name, c.hostname, c.oui)
+                SET src_device_id = dn.id
                 FROM unifi_clients c
+                JOIN device_names dn
+                  ON lower(dn.name) = lower(COALESCE(c.device_name, c.hostname, c.oui))
                 WHERE logs.mac_address = c.mac
-                  AND logs.src_device_name IS NULL
+                  AND logs.src_device_id IS NULL
                   AND logs.timestamp >= %s::timestamptz
-                  AND COALESCE(c.device_name, c.hostname, c.oui) IS NOT NULL
             """, [since])
             src_patched = cur.rowcount
 
-            # dst_device_name: IP-based join with time window to limit DHCP misattribution
+            # dst_device_id: IP-based join with time window to limit DHCP misattribution
             cur.execute("""
                 UPDATE logs
-                SET dst_device_name = sub.name
+                SET dst_device_id = sub.name_id
                 FROM (
-                    SELECT DISTINCT ON (host(ip)) ip,
-                           COALESCE(device_name, hostname, oui) as name,
-                           last_seen
-                    FROM unifi_clients
-                    WHERE COALESCE(device_name, hostname, oui) IS NOT NULL
-                    ORDER BY host(ip), last_seen DESC NULLS LAST
+                    SELECT DISTINCT ON (host(c.ip)) c.ip,
+                           dn.id AS name_id,
+                           c.last_seen
+                    FROM unifi_clients c
+                    JOIN device_names dn
+                      ON lower(dn.name) = lower(COALESCE(c.device_name, c.hostname, c.oui))
+                    ORDER BY host(c.ip), c.last_seen DESC NULLS LAST
                 ) sub
                 WHERE logs.dst_ip = sub.ip
-                  AND logs.dst_device_name IS NULL
+                  AND logs.dst_device_id IS NULL
                   AND logs.timestamp >= %s::timestamptz
                   AND logs.timestamp >= sub.last_seen - INTERVAL '1 day'
             """, [since])
             dst_patched = cur.rowcount
 
         conn.commit()
+        # New names were interned above; the in-memory cache predates them.
+        enricher_db.lookups.device_names.reload()
         logger.info("Device name backfill: %d src, %d dst patched (since %s)",
                      src_patched, dst_patched, since)
         return {

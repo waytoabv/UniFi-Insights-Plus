@@ -77,19 +77,8 @@ can be overridden with `--force-unsupported` if you know what you are arranging.
    systemctl restart uip-api uip-receiver
    ```
 
-AbuseIPDB and UniFi credentials can also be entered in the UI, where environment
-variables take precedence over values stored in the database. **MaxMind is the
-exception** — it has no UI fields at all, so the environment file is the only
-place it is configured. Having added the credentials, fetch the databases
-immediately rather than waiting for the schedule:
-
-```bash
-systemctl start uip-geoip.service
-```
-
-The timer otherwise runs Wednesdays and Saturdays at 07:00 UTC, plus three
-minutes after boot. Without credentials there is no GeoIP data at all — no
-databases ship with the repository, despite what `.env.example` implies.
+Credentials can also be entered in the UI; environment variables take precedence
+over values stored in the database.
 
 ## What runs where
 

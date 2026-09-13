@@ -282,12 +282,6 @@ API_PORT=8000
 
 # ── Optional integrations ──
 ABUSEIPDB_API_KEY=
-
-# GeoIP and ASN lookups. There are no fields for these in the UI — this file is
-# the only place they are read from. Account ID and license key come from
-# maxmind.com under My Account and Manage License Keys (not your password).
-# After filling them in, fetch the databases right away with:
-#     systemctl start uip-geoip.service
 MAXMIND_ACCOUNT_ID=
 MAXMIND_LICENSE_KEY=
 
@@ -474,6 +468,30 @@ if [ -n "${MAXMIND_ACCOUNT_ID:-}" ] && [ -n "${MAXMIND_LICENSE_KEY:-}" ]; then
     fi
 else
     warn "MAXMIND_ACCOUNT_ID / MAXMIND_LICENSE_KEY are unset — GeoIP enrichment stays disabled until you set them in $ENV_FILE."
+fi
+
+# ── Schema migration ─────────────────────────────────────────────────────────
+
+# The normalised schema replaces the text columns with SMALLINT keys. The
+# migration rebuilds the table, so nothing may be writing to it — services are
+# stopped here even if they were already down. It detects an already-migrated
+# database and exits without doing anything, so this is safe on every run.
+if [ "$EXTERNAL_DB" != "true" ]; then
+    msg "Checking the log schema..."
+    systemctl stop uip-receiver.service uip-api.service >/dev/null 2>&1 || true
+
+    # The configuration is already exported into this shell, so the migration
+    # inherits DB_* and POSTGRES_PASSWORD directly. It runs as root because it
+    # is a one-shot admin operation that writes nothing under /app.
+    if (cd "$APP_DIR" && "$APP_DIR/venv/bin/python" "$APP_DIR/migrate_schema.py"); then
+        ok "Log schema is current."
+    else
+        warn "The schema migration did not complete. The previous table is intact;"
+        warn "the services stay stopped so nothing writes into a half-migrated database."
+        warn "Inspect the output above, then re-run:"
+        warn "    $APP_DIR/venv/bin/python $APP_DIR/migrate_schema.py"
+        exit 1
+    fi
 fi
 
 # ── Start ────────────────────────────────────────────────────────────────────

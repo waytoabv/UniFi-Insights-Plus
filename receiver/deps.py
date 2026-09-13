@@ -96,6 +96,11 @@ def put_conn(conn):
 
 enricher_db = Database(conn_params, min_conn=1, max_conn=3)
 enricher_db.connect()
+
+# Filters resolve text to ids through these; bind them before any route runs.
+import query_helpers as _query_helpers
+_query_helpers.set_lookups(enricher_db.lookups)
+
 abuseipdb = AbuseIPDBEnricher(db=enricher_db)
 
 # ── UniFi API Client ────────────────────────────────────────────────────────

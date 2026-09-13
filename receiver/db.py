@@ -130,6 +130,12 @@ def wait_for_postgres(conn_params: dict, max_retries: int = 30, delay: float = 2
     sys.exit(1)
 
 
+# Closed-set ids inlined into index predicates and UPDATE filters below.
+# Derived from lookups.CLOSED_SETS so the SQL cannot drift from the mapping.
+_LT_FIREWALL = lookups.log_type_id('firewall')
+_LT_DNS = lookups.log_type_id('dns')
+_RA_BLOCK = lookups.rule_action_id('block')
+
 # Column names matching the logs table.
 #
 # Ordered by alignment — 8-byte types, then 4, then 2, then variable length.
@@ -301,7 +307,7 @@ class RetentionDaysConfig(NamedTuple):
 
 
 class Database:
-    """PostgreSQL connection pool and operations."""
+    """PostgreSQL connection pool and operations.f"""
 
     # Heavyweight indexes created post-boot with CONCURRENTLY for upgrades.
     # Fresh installs get these from init.sql; this list handles existing installs.
@@ -309,7 +315,7 @@ class Database:
         {
             'name': 'idx_logs_spgist_dst_ip_firewall',
             'sql': "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_logs_spgist_dst_ip_firewall "
-                   "ON logs USING spgist (dst_ip) WHERE log_type = 'firewall'",
+                   f"ON logs USING spgist (dst_ip) WHERE log_type_id = {_LT_FIREWALL}",
             'label': 'SP-GiST dst_ip for WAN detection',
         },
         {
@@ -321,7 +327,7 @@ class Database:
         {
             'name': 'idx_logs_nondns_timestamp',
             'sql': "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_logs_nondns_timestamp "
-                   "ON logs (timestamp DESC) WHERE log_type != 'dns'",
+                   "ON logs (timestamp DESC) WHERE log_type_id IS DISTINCT FROM the dns id",
             'label': 'non-DNS retention cleanup',
         },
     ]
@@ -400,9 +406,46 @@ class Database:
         )
         logger.info("PostgreSQL connection pool ready (min=%d, max=%d)", self.min_conn, self.max_conn)
         self._ensure_schema()
+        self._populate_services()
         # Warm the lookup caches now so the first insert does not pay for four
         # table reads while the UDP receive loop is waiting on it.
         self._lookups = LogLookups(self)
+
+    def _populate_services(self):
+        """Load the IANA service names into the services table.
+
+        service_name is no longer a column on logs — it is a function of port
+        and protocol. The API resolves it in Python, but the logs_text view
+        needs it in SQL, so the same mapping is mirrored into a table here.
+
+        Runs once: the table is only filled when empty, and the CSV only
+        changes with a release.
+        """
+        try:
+            from services import get_service_mappings
+
+            with self.get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1 FROM services LIMIT 1")
+                    if cur.fetchone() is not None:
+                        return
+                    rows = [(port, proto, name)
+                            for (port, proto), name in get_service_mappings().items()
+                            if name]
+                    if not rows:
+                        return
+                    extras.execute_values(
+                        cur,
+                        "INSERT INTO services (port, proto, name) VALUES %s "
+                        "ON CONFLICT (port, proto) DO NOTHING",
+                        rows, page_size=1000,
+                    )
+                    conn.commit()
+            logger.info("Loaded %d IANA service names", len(rows))
+        except Exception:
+            # A missing service name degrades the view to NULL, which the UI
+            # already renders as "Unknown". Not worth failing start-up over.
+            logger.warning("Could not populate the services table", exc_info=True)
 
     def _ensure_schema(self):
         """Run idempotent schema migrations (safe on every boot).
@@ -414,61 +457,80 @@ class Database:
         """
         migrations = [
             # ── Base schema (matches init.sql) ────────────────────────────
+            # Column order follows alignment — 8-byte types, then 4, then 2,
+            # then variable length. PostgreSQL pads each column to its own
+            # boundary, and at 61 inserts/s the padding of a grown-over-time
+            # order is measurable.
+            #
+            # The *_id columns reference the lookup tables above but carry no
+            # foreign keys. Those tables are append-only and written solely
+            # through lookups.LookupTable, and the logs_text view resolves them
+            # with LEFT JOINs, so a dangling id degrades to NULL rather than
+            # breaking a read. Ten FK checks on the hottest path in the system
+            # is a poor trade for a constraint nothing can violate.
             """CREATE TABLE IF NOT EXISTS logs (
-                id          BIGSERIAL PRIMARY KEY,
-                timestamp   TIMESTAMPTZ NOT NULL,
-                log_type    VARCHAR(20) NOT NULL,
-                direction   VARCHAR(20),
-                src_ip      INET,
-                src_port    INTEGER,
-                dst_ip      INET,
-                dst_port    INTEGER,
-                protocol    VARCHAR(10),
-                service_name TEXT,
-                rule_name   VARCHAR(100),
-                rule_desc   VARCHAR(255),
-                rule_action VARCHAR(20),
-                interface_in  VARCHAR(20),
-                interface_out VARCHAR(20),
-                mac_address MACADDR,
-                hostname    VARCHAR(255),
-                dns_query   VARCHAR(255),
-                dns_type    VARCHAR(10),
-                dns_answer  VARCHAR(255),
-                dhcp_event  VARCHAR(20),
-                wifi_event  VARCHAR(50),
-                geo_country VARCHAR(2),
-                geo_city    VARCHAR(100),
-                geo_lat     DECIMAL(9,6),
-                geo_lon     DECIMAL(9,6),
-                asn_number  INTEGER,
-                asn_name    VARCHAR(255),
-                threat_score    INTEGER,
-                threat_categories TEXT[],
-                rdns        VARCHAR(255),
-                abuse_usage_type TEXT,
-                abuse_hostnames TEXT,
-                abuse_total_reports INTEGER,
-                abuse_last_reported TIMESTAMPTZ,
+                id                   BIGSERIAL PRIMARY KEY,
+                timestamp            TIMESTAMPTZ NOT NULL,
+                abuse_last_reported  TIMESTAMPTZ,
+                src_port             INTEGER,
+                dst_port             INTEGER,
+                asn_number           INTEGER,
+                threat_score         INTEGER,
+                abuse_total_reports  INTEGER,
+                log_type_id          SMALLINT,
+                direction_id         SMALLINT,
+                rule_id              SMALLINT,
+                rule_action_id       SMALLINT,
+                protocol_id          SMALLINT,
+                iface_in_id          SMALLINT,
+                iface_out_id         SMALLINT,
+                hostname_id          SMALLINT,
+                src_device_id        SMALLINT,
+                dst_device_id        SMALLINT,
                 abuse_is_whitelisted BOOLEAN,
-                abuse_is_tor BOOLEAN,
-                src_device_name TEXT,
-                dst_device_name TEXT,
-                remote_ip   INET,
-                raw_log     TEXT NOT NULL,
-                created_at  TIMESTAMPTZ DEFAULT NOW()
+                abuse_is_tor         BOOLEAN,
+                src_ip               INET,
+                dst_ip               INET,
+                remote_ip            INET,
+                mac_address          MACADDR,
+                geo_country          VARCHAR(2),
+                geo_city             VARCHAR(100),
+                geo_lat              DECIMAL(9,6),
+                geo_lon              DECIMAL(9,6),
+                asn_name             VARCHAR(255),
+                threat_categories    TEXT[],
+                rdns                 VARCHAR(255),
+                abuse_usage_type     TEXT,
+                abuse_hostnames      TEXT,
+                dns_query            VARCHAR(255),
+                dns_type             VARCHAR(10),
+                dns_answer           VARCHAR(255),
+                dhcp_event           VARCHAR(20),
+                wifi_event           VARCHAR(50),
+                raw_log              TEXT
             )""",
-            # Performance indexes from init.sql
+            # Performance indexes.
+            #
+            # Dropped against the previous set, based on a day of measured
+            # pg_stat_user_indexes on a live install at 61 rows/s:
+            #   idx_logs_type_id     319 MB, 1 scan  — served an admin purge
+            #   idx_logs_src_port     31 MB, 0 scans
+            #   idx_logs_protocol     29 MB, 0 scans — four distinct values
+            #   idx_logs_service_name 30 MB, 6 scans — column no longer exists
+            # Together 409 MB and four fewer index updates per INSERT.
             "CREATE INDEX IF NOT EXISTS idx_logs_timestamp    ON logs (timestamp DESC)",
             "CREATE INDEX IF NOT EXISTS idx_logs_src_ip       ON logs (src_ip)",
             "CREATE INDEX IF NOT EXISTS idx_logs_dst_ip       ON logs (dst_ip)",
-            "CREATE INDEX IF NOT EXISTS idx_logs_direction    ON logs (direction)",
+            "CREATE INDEX IF NOT EXISTS idx_logs_direction    ON logs (direction_id)",
             "CREATE INDEX IF NOT EXISTS idx_logs_threat_score ON logs (threat_score) WHERE threat_score IS NOT NULL",
-            "CREATE INDEX IF NOT EXISTS idx_logs_type_time    ON logs (log_type, timestamp DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_logs_action_time  ON logs (rule_action, timestamp DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_logs_src_port     ON logs (src_port) WHERE src_port IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_logs_type_time    ON logs (log_type_id, timestamp DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_logs_action_time  ON logs (rule_action_id, timestamp DESC)",
             "CREATE INDEX IF NOT EXISTS idx_logs_dst_port     ON logs (dst_port) WHERE dst_port IS NOT NULL",
-            "CREATE INDEX IF NOT EXISTS idx_logs_protocol     ON logs (protocol) WHERE protocol IS NOT NULL",
+            "DROP INDEX IF EXISTS idx_logs_type_id",
+            "DROP INDEX IF EXISTS idx_logs_src_port",
+            "DROP INDEX IF EXISTS idx_logs_protocol",
+            "DROP INDEX IF EXISTS idx_logs_service_name",
+            "DROP INDEX IF EXISTS idx_logs_fw_service_name_null_id",
             # ── Migrations (existing) ─────────────────────────────────────
             # ip_threats persistent cache (added Phase 6)
             """CREATE TABLE IF NOT EXISTS ip_threats (
@@ -492,9 +554,6 @@ class Database:
             "ALTER TABLE ip_threats ADD COLUMN IF NOT EXISTS abuse_last_reported TIMESTAMPTZ",
             "ALTER TABLE ip_threats ADD COLUMN IF NOT EXISTS abuse_is_whitelisted BOOLEAN",
             "ALTER TABLE ip_threats ADD COLUMN IF NOT EXISTS abuse_is_tor BOOLEAN",
-            # IANA service name mapping (after protocol column)
-            "ALTER TABLE logs ADD COLUMN IF NOT EXISTS service_name TEXT",
-            "CREATE INDEX IF NOT EXISTS idx_logs_service_name ON logs (service_name) WHERE service_name IS NOT NULL",
             # System configuration table for dynamic settings
             # Must be created before any migration block that may reference it.
             """CREATE TABLE IF NOT EXISTS system_config (
@@ -502,22 +561,10 @@ class Database:
                 value JSONB NOT NULL,
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             )""",
-            # Normalize protocol to lowercase for index optimization
-            # Uses system_config marker to skip on subsequent boots (matches backfill pattern)
-            """DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM system_config
-    WHERE key = 'protocol_normalization_done'
-      AND value = 'true'::jsonb
-  ) THEN
-    UPDATE logs SET protocol = LOWER(protocol)
-    WHERE protocol IS NOT NULL AND protocol != LOWER(protocol);
-    INSERT INTO system_config (key, value, updated_at)
-    VALUES ('protocol_normalization_done', 'true'::jsonb, NOW())
-    ON CONFLICT (key) DO UPDATE SET value = 'true'::jsonb, updated_at = NOW();
-  END IF;
-END $$;""",
+            # (The protocol lowercase-normalisation migration was removed with the
+            # schema normalisation: protocol is now a foreign key into the
+            # protocols table, which is unique on lower(name), so casing can no
+            # longer diverge between rows.)
             # Legacy MCP tables — only create if not already migrated to api_tokens
             """DO $$ BEGIN
                 IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = '_mcp_tokens_backup' AND table_schema = 'public')
@@ -563,9 +610,9 @@ END $$;""",
                VALUES ('abuse_hostname_fix_done', 'false', NOW())
                ON CONFLICT (key) DO NOTHING""",
             # Flow aggregation index (Sankey + IP Pairs)
-            """CREATE INDEX IF NOT EXISTS idx_logs_flow_agg
+            f"""CREATE INDEX IF NOT EXISTS idx_logs_flow_agg
                 ON logs (timestamp DESC, src_ip, dst_ip, dst_port, protocol)
-                WHERE log_type = 'firewall' AND src_ip IS NOT NULL AND dst_ip IS NOT NULL""",
+                WHERE log_type_id = {_LT_FIREWALL} AND src_ip IS NOT NULL AND dst_ip IS NOT NULL""",
             # Phase 2: Device name columns on logs
             "ALTER TABLE logs ADD COLUMN IF NOT EXISTS src_device_name TEXT",
             "ALTER TABLE logs ADD COLUMN IF NOT EXISTS dst_device_name TEXT",
@@ -611,9 +658,9 @@ END $$;""",
             )""",
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_views_name ON saved_views (name)",
             # Zone matrix aggregation (interface-to-interface traffic)
-            """CREATE INDEX IF NOT EXISTS idx_logs_zone_matrix
-                ON logs (timestamp DESC, interface_in, interface_out, rule_action)
-                WHERE log_type = 'firewall' AND interface_in IS NOT NULL AND interface_out IS NOT NULL""",
+            f"""CREATE INDEX IF NOT EXISTS idx_logs_zone_matrix
+                ON logs (timestamp DESC, iface_in_id, iface_out_id, rule_action_id)
+                WHERE log_type_id = {_LT_FIREWALL} AND iface_in_id IS NOT NULL AND iface_out_id IS NOT NULL""",
             # cleanup_old_logs() SQL function removed — retention cleanup now
             # runs as a batched Python engine in run_retention_cleanup().
             # Drop the orphaned function from existing databases.
@@ -768,39 +815,33 @@ END $$;""",
                   AND abuse_total_reports IS NULL AND abuse_last_reported IS NULL
                   AND abuse_is_whitelisted IS NULL AND abuse_is_tor IS NULL""",
             # 3. Targeted log patch indexes for threat-score repair
-            """CREATE INDEX IF NOT EXISTS idx_logs_fw_block_null_threat_src
+            f"""CREATE INDEX IF NOT EXISTS idx_logs_fw_block_null_threat_src
                 ON logs (src_ip)
-                WHERE log_type = 'firewall'
-                  AND rule_action = 'block'
+                WHERE log_type_id = {_LT_FIREWALL}
+                  AND rule_action_id = {_RA_BLOCK}
                   AND threat_score IS NULL
                   AND src_ip IS NOT NULL""",
-            """CREATE INDEX IF NOT EXISTS idx_logs_fw_block_null_threat_dst
+            f"""CREATE INDEX IF NOT EXISTS idx_logs_fw_block_null_threat_dst
                 ON logs (dst_ip)
-                WHERE log_type = 'firewall'
-                  AND rule_action = 'block'
+                WHERE log_type_id = {_LT_FIREWALL}
+                  AND rule_action_id = {_RA_BLOCK}
                   AND threat_score IS NULL
                   AND dst_ip IS NOT NULL""",
             # 4. Targeted log patch indexes for abuse-detail repair
-            """CREATE INDEX IF NOT EXISTS idx_logs_fw_block_missing_abuse_src
+            f"""CREATE INDEX IF NOT EXISTS idx_logs_fw_block_missing_abuse_src
                 ON logs (src_ip)
-                WHERE log_type = 'firewall'
-                  AND rule_action = 'block'
+                WHERE log_type_id = {_LT_FIREWALL}
+                  AND rule_action_id = {_RA_BLOCK}
                   AND threat_score IS NOT NULL
                   AND abuse_usage_type IS NULL
                   AND src_ip IS NOT NULL""",
-            """CREATE INDEX IF NOT EXISTS idx_logs_fw_block_missing_abuse_dst
+            f"""CREATE INDEX IF NOT EXISTS idx_logs_fw_block_missing_abuse_dst
                 ON logs (dst_ip)
-                WHERE log_type = 'firewall'
-                  AND rule_action = 'block'
+                WHERE log_type_id = {_LT_FIREWALL}
+                  AND rule_action_id = {_RA_BLOCK}
                   AND threat_score IS NOT NULL
                   AND abuse_usage_type IS NULL
                   AND dst_ip IS NOT NULL""",
-            # 5. One-shot service-name migration support (ID-cursor reads)
-            """CREATE INDEX IF NOT EXISTS idx_logs_fw_service_name_null_id
-                ON logs (id)
-                WHERE log_type = 'firewall'
-                  AND service_name IS NULL
-                  AND dst_port IS NOT NULL""",
             # ── Issue #98: persistent rDNS cache (DB-backed cold tier) ─────
             """CREATE TABLE IF NOT EXISTS rdns_cache (
                 ip            INET PRIMARY KEY,
@@ -845,6 +886,58 @@ END $$;""",
             )""",
             """CREATE UNIQUE INDEX IF NOT EXISTS idx_protocols_key
                 ON protocols (lower(name))""",
+            # IANA service names, so the compatibility view below can resolve
+            # service_name without the column being stored per row. Populated
+            # once from the bundled CSV by _populate_services().
+            """CREATE TABLE IF NOT EXISTS services (
+                port   INTEGER NOT NULL,
+                proto  VARCHAR(10) NOT NULL,
+                name   TEXT NOT NULL,
+                PRIMARY KEY (port, proto)
+            )""",
+            # ── Compatibility view ────────────────────────────────────────
+            # Aggregate queries in stats.py, flows.py, mcp.py and threats.py
+            # group and filter by the text values. Rewriting all 171 of those
+            # expressions by hand would be a large, error-prone diff for no
+            # gain: they are read-only, and the lookup tables are small enough
+            # that resolving them in SQL costs a hash join over tens of rows.
+            #
+            # The view exposes l.* — including the id columns — so a WHERE
+            # clause built by query_helpers works against it unchanged, while
+            # the text columns keep the existing GROUP BY expressions working.
+            #
+            # The hot path (/api/logs) reads the table directly and resolves in
+            # Python; it never goes through here.
+            """CREATE OR REPLACE VIEW logs_text AS
+                SELECT l.*,
+                       lt.name          AS log_type,
+                       ra.name          AS rule_action,
+                       dr.name          AS direction,
+                       p.name           AS protocol,
+                       r.name           AS rule_name,
+                       r.descr          AS rule_desc,
+                       ii.name          AS interface_in,
+                       io.name          AS interface_out,
+                       hn.name          AS hostname,
+                       sdn.name         AS src_device_name,
+                       ddn.name         AS dst_device_name,
+                       sv.name          AS service_name
+                FROM logs l
+                LEFT JOIN """ + lookups.sql_values_clause('log_type') + """
+                     AS lt(id, name) ON lt.id = l.log_type_id
+                LEFT JOIN """ + lookups.sql_values_clause('rule_action') + """
+                     AS ra(id, name) ON ra.id = l.rule_action_id
+                LEFT JOIN """ + lookups.sql_values_clause('direction') + """
+                     AS dr(id, name) ON dr.id = l.direction_id
+                LEFT JOIN protocols    p   ON p.id   = l.protocol_id
+                LEFT JOIN rules        r   ON r.id   = l.rule_id
+                LEFT JOIN interfaces   ii  ON ii.id  = l.iface_in_id
+                LEFT JOIN interfaces   io  ON io.id  = l.iface_out_id
+                LEFT JOIN device_names hn  ON hn.id  = l.hostname_id
+                LEFT JOIN device_names sdn ON sdn.id = l.src_device_id
+                LEFT JOIN device_names ddn ON ddn.id = l.dst_device_id
+                LEFT JOIN services     sv  ON sv.port = l.dst_port
+                                          AND sv.proto = p.name""",
         ]
         try:
             with self.get_conn() as conn:
@@ -1322,11 +1415,11 @@ END $$;""",
 
     def run_retention_cleanup(self, general_days: int = 60, dns_days: int = 10,
                               progress_cb=None) -> dict:
-        """Delete expired logs in small batches to avoid long-held locks.
+        f"""Delete expired logs in small batches to avoid long-held locks.
 
         Two separate passes (DNS / non-DNS) let each use its own index:
           - DNS pass:     idx_logs_type_time (log_type, timestamp DESC)
-          - non-DNS pass: idx_logs_nondns_timestamp (timestamp DESC) WHERE log_type != 'dns'
+          - non-DNS pass: idx_logs_nondns_timestamp (timestamp DESC) WHERE log_type_id IS DISTINCT FROM {_LT_DNS}
 
         Each batch commits immediately so autovacuum can reclaim dead tuples
         incrementally.
@@ -1347,9 +1440,12 @@ END $$;""",
 
         batch_size = self.RETENTION_BATCH_SIZE
         now = datetime.now(timezone.utc)
+        dns_id = lookups.log_type_id('dns')
         passes = [
-            ("dns",     "log_type = 'dns'",  now - timedelta(days=dns_days)),
-            ("non_dns", "log_type != 'dns'", now - timedelta(days=general_days)),
+            ("dns",     f"log_type_id = {dns_id}",  now - timedelta(days=dns_days)),
+            # IS DISTINCT FROM rather than != so rows whose type never resolved
+            # are still covered by the general retention pass.
+            ("non_dns", f"log_type_id IS DISTINCT FROM {dns_id}", now - timedelta(days=general_days)),
         ]
 
         result = {
@@ -1633,7 +1729,7 @@ END $$;""",
         """Targeted: copy threat data from ip_threats to logs for specific IPs.
 
         Two passes (src_ip, dst_ip) with WAN IP exclusion.
-        """
+        f"""
         if not ips:
             return 0
         total = 0
@@ -1655,8 +1751,8 @@ END $$;""",
                     "  AND t.ip = ANY(%s::inet[]) "
                     "  AND NOT (logs.src_ip = ANY(%s::inet[])) "
                     "  AND logs.threat_score IS NULL "
-                    "  AND logs.log_type = 'firewall' "
-                    "  AND logs.rule_action = 'block'",
+                    f"  AND logs.log_type_id = {_LT_FIREWALL} "
+                    f"  AND logs.rule_action_id = {_RA_BLOCK}",
                     [ips, wan_ips]
                 )
                 total += cur.rowcount
@@ -1676,8 +1772,8 @@ END $$;""",
                     "  AND t.ip = ANY(%s::inet[]) "
                     "  AND NOT (logs.dst_ip = ANY(%s::inet[])) "
                     "  AND logs.threat_score IS NULL "
-                    "  AND logs.log_type = 'firewall' "
-                    "  AND logs.rule_action = 'block'",
+                    f"  AND logs.log_type_id = {_LT_FIREWALL} "
+                    f"  AND logs.rule_action_id = {_RA_BLOCK}",
                     [ips, wan_ips]
                 )
                 total += cur.rowcount
@@ -1688,7 +1784,7 @@ END $$;""",
 
         Only updates rows that have a threat_score but are missing abuse detail.
         Two passes (src_ip, dst_ip) with WAN IP exclusion.
-        """
+        f"""
         if not ips:
             return 0
         total = 0
@@ -1721,8 +1817,8 @@ END $$;""",
                     "  AND (t.abuse_usage_type IS NOT NULL OR t.abuse_hostnames IS NOT NULL "
                     "       OR t.abuse_total_reports IS NOT NULL OR t.abuse_last_reported IS NOT NULL "
                     "       OR t.abuse_is_whitelisted IS NOT NULL OR t.abuse_is_tor IS NOT NULL) "
-                    "  AND logs.log_type = 'firewall' "
-                    "  AND logs.rule_action = 'block'",
+                    f"  AND logs.log_type_id = {_LT_FIREWALL} "
+                    f"  AND logs.rule_action_id = {_RA_BLOCK}",
                     [ips, wan_ips]
                 )
                 total += cur.rowcount
@@ -1753,8 +1849,8 @@ END $$;""",
                     "  AND (t.abuse_usage_type IS NOT NULL OR t.abuse_hostnames IS NOT NULL "
                     "       OR t.abuse_total_reports IS NOT NULL OR t.abuse_last_reported IS NOT NULL "
                     "       OR t.abuse_is_whitelisted IS NOT NULL OR t.abuse_is_tor IS NOT NULL) "
-                    "  AND logs.log_type = 'firewall' "
-                    "  AND logs.rule_action = 'block'",
+                    f"  AND logs.log_type_id = {_LT_FIREWALL} "
+                    f"  AND logs.rule_action_id = {_RA_BLOCK}",
                     [ips, wan_ips]
                 )
                 total += cur.rowcount
@@ -1784,41 +1880,6 @@ END $$;""",
                     [limit]
                 )
                 return [row[0] for row in cur.fetchall()]
-
-    def service_name_backfill_batch(self, last_id: int, batch_size: int = 1000):
-        """Read a batch of firewall logs missing service_name for one-shot migration.
-
-        Returns list of (id, dst_port, protocol) tuples.
-        """
-        with self.get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT id, dst_port, protocol FROM logs "
-                    "WHERE id > %s "
-                    "  AND log_type = 'firewall' "
-                    "  AND service_name IS NULL "
-                    "  AND dst_port IS NOT NULL "
-                    "ORDER BY id LIMIT %s",
-                    [last_id, batch_size]
-                )
-                return cur.fetchall()
-
-    def patch_service_names(self, updates: list[tuple]):
-        """Batch update service_name for specific log IDs.
-
-        updates = [(id, service_name), ...]
-        """
-        if not updates:
-            return 0
-        with self.get_conn() as conn:
-            with conn.cursor() as cur:
-                extras.execute_batch(
-                    cur,
-                    "UPDATE logs SET service_name = %s WHERE id = %s AND service_name IS NULL",
-                    [(name, log_id) for log_id, name in updates],
-                    page_size=500
-                )
-                return len(updates)
 
     def get_queue_stats(self) -> dict:
         """Return queue statistics for logging/monitoring."""

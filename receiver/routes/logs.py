@@ -17,7 +17,8 @@ from ip_identity import load_identity_config, annotate_record, annotate_ip
 from query_helpers import (build_log_query, validate_time_params,
                           device_name_client_lateral, device_name_device_lateral,
                           device_name_coalesce, sanitize_csv_cell)
-from services import get_service_description
+import lookups
+from services import get_service_description, get_service_name
 
 
 
@@ -86,9 +87,11 @@ def get_logs(
                         ORDER BY {sort_col} {sort_dir} LIMIT %s OFFSET %s
                     )
                     SELECT page.*,
-                        {device_name_coalesce('c1', 'd1', 'src_device_name', 'page.src_device_name')},
-                        {device_name_coalesce('c2', 'd2', 'dst_device_name', 'page.dst_device_name')}
+                        {device_name_coalesce('c1', 'd1', 'src_device_name', 'sdn.name')},
+                        {device_name_coalesce('c2', 'd2', 'dst_device_name', 'ddn.name')}
                     FROM page
+                    LEFT JOIN device_names sdn ON sdn.id = page.src_device_id
+                    LEFT JOIN device_names ddn ON ddn.id = page.dst_device_id
                     LEFT JOIN unifi_clients c1 ON c1.mac = page.mac_address
                     {device_name_client_lateral('page.dst_ip', 'c2')}
                     LEFT JOIN unifi_devices d1 ON d1.mac = page.mac_address
@@ -239,7 +242,7 @@ def get_logs_aggregate(
 
     sql = f"""
         SELECT {', '.join(select_parts)}
-        FROM logs
+        FROM logs_text
         WHERE {where}
         GROUP BY {sql_expr}
         {having_sql}
@@ -275,43 +278,49 @@ def get_logs_aggregate(
 
 # Join ip_threats on both src and dst to fill abuse fields for logs not yet
 # patched by the backfill daemon.  WAN IPs excluded via params.
-_LOG_DETAIL_SQL = """
+# Direction ids inlined into _LOG_DETAIL_SQL. The legacy 'in'/'out' spellings
+# the old SQL also accepted never had ids of their own — they were aliases for
+# the canonical values, which is what these resolve to.
+_DIR_INBOUND = lookups.direction_id('inbound')
+_DIR_OUTBOUND = lookups.direction_id('outbound')
+
+_LOG_DETAIL_SQL = f"""
     SELECT l.*,
         COALESCE(l.abuse_usage_type,
-            CASE WHEN l.direction IN ('inbound', 'in') THEN t1.abuse_usage_type
-                 WHEN l.direction IN ('outbound', 'out') THEN t2.abuse_usage_type
+            CASE WHEN l.direction_id = {_DIR_INBOUND} THEN t1.abuse_usage_type
+                 WHEN l.direction_id = {_DIR_OUTBOUND} THEN t2.abuse_usage_type
                  WHEN t1.ip IS NOT NULL THEN t1.abuse_usage_type
                  ELSE t2.abuse_usage_type END) as abuse_usage_type,
         COALESCE(l.abuse_hostnames,
-            CASE WHEN l.direction IN ('inbound', 'in') THEN t1.abuse_hostnames
-                 WHEN l.direction IN ('outbound', 'out') THEN t2.abuse_hostnames
+            CASE WHEN l.direction_id = {_DIR_INBOUND} THEN t1.abuse_hostnames
+                 WHEN l.direction_id = {_DIR_OUTBOUND} THEN t2.abuse_hostnames
                  WHEN t1.ip IS NOT NULL THEN t1.abuse_hostnames
                  ELSE t2.abuse_hostnames END) as abuse_hostnames,
         COALESCE(l.abuse_total_reports,
-            CASE WHEN l.direction IN ('inbound', 'in') THEN t1.abuse_total_reports
-                 WHEN l.direction IN ('outbound', 'out') THEN t2.abuse_total_reports
+            CASE WHEN l.direction_id = {_DIR_INBOUND} THEN t1.abuse_total_reports
+                 WHEN l.direction_id = {_DIR_OUTBOUND} THEN t2.abuse_total_reports
                  WHEN t1.ip IS NOT NULL THEN t1.abuse_total_reports
                  ELSE t2.abuse_total_reports END) as abuse_total_reports,
         COALESCE(l.abuse_last_reported,
-            CASE WHEN l.direction IN ('inbound', 'in') THEN t1.abuse_last_reported
-                 WHEN l.direction IN ('outbound', 'out') THEN t2.abuse_last_reported
+            CASE WHEN l.direction_id = {_DIR_INBOUND} THEN t1.abuse_last_reported
+                 WHEN l.direction_id = {_DIR_OUTBOUND} THEN t2.abuse_last_reported
                  WHEN t1.ip IS NOT NULL THEN t1.abuse_last_reported
                  ELSE t2.abuse_last_reported END) as abuse_last_reported,
         COALESCE(l.abuse_is_whitelisted,
-            CASE WHEN l.direction IN ('inbound', 'in') THEN t1.abuse_is_whitelisted
-                 WHEN l.direction IN ('outbound', 'out') THEN t2.abuse_is_whitelisted
+            CASE WHEN l.direction_id = {_DIR_INBOUND} THEN t1.abuse_is_whitelisted
+                 WHEN l.direction_id = {_DIR_OUTBOUND} THEN t2.abuse_is_whitelisted
                  WHEN t1.ip IS NOT NULL THEN t1.abuse_is_whitelisted
                  ELSE t2.abuse_is_whitelisted END) as abuse_is_whitelisted,
         COALESCE(l.abuse_is_tor,
-            CASE WHEN l.direction IN ('inbound', 'in') THEN t1.abuse_is_tor
-                 WHEN l.direction IN ('outbound', 'out') THEN t2.abuse_is_tor
+            CASE WHEN l.direction_id = {_DIR_INBOUND} THEN t1.abuse_is_tor
+                 WHEN l.direction_id = {_DIR_OUTBOUND} THEN t2.abuse_is_tor
                  WHEN t1.ip IS NOT NULL THEN t1.abuse_is_tor
                  ELSE t2.abuse_is_tor END) as abuse_is_tor,
         COALESCE(
             CASE WHEN array_length(l.threat_categories, 1) > 0 THEN l.threat_categories END,
-            CASE WHEN l.direction IN ('inbound', 'in') THEN
+            CASE WHEN l.direction_id = {_DIR_INBOUND} THEN
                      CASE WHEN array_length(t1.threat_categories, 1) > 0 THEN t1.threat_categories END
-                 WHEN l.direction IN ('outbound', 'out') THEN
+                 WHEN l.direction_id = {_DIR_OUTBOUND} THEN
                      CASE WHEN array_length(t2.threat_categories, 1) > 0 THEN t2.threat_categories END
                  WHEN t1.ip IS NOT NULL THEN
                      CASE WHEN array_length(t1.threat_categories, 1) > 0 THEN t1.threat_categories END
@@ -334,8 +343,31 @@ _LOG_DETAIL_SQL = """
 
 
 def _serialize_log(row):
-    """Convert a raw log DB row to API-friendly dict."""
+    """Convert a raw log DB row to API-friendly dict.
+
+    The logs table stores small integer keys for the low-cardinality columns.
+    They are resolved back to text here, so the response carries the same field
+    names and values it always has and the frontend is unaffected by the
+    storage change. The lookup tables hold tens of rows and live in memory, so
+    this costs a dict access per field, not a join.
+    """
     log = dict(row)
+    lk = enricher_db.lookups
+
+    log['log_type'] = lookups.log_type_text(log.pop('log_type_id', None))
+    log['direction'] = lookups.direction_text(log.pop('direction_id', None))
+    log['rule_action'] = lookups.rule_action_text(log.pop('rule_action_id', None))
+    log['protocol'] = lk.protocols.text_for(log.pop('protocol_id', None))
+    log['interface_in'] = lk.interfaces.text_for(log.pop('iface_in_id', None))
+    log['interface_out'] = lk.interfaces.text_for(log.pop('iface_out_id', None))
+    log['hostname'] = lk.device_names.text_for(log.pop('hostname_id', None))
+
+    rule = lk.rules.text_for(log.pop('rule_id', None))
+    log['rule_name'], log['rule_desc'] = rule if rule else (None, None)
+
+    # service_name is no longer stored — it is a function of port and protocol.
+    log['service_name'] = get_service_name(log.get('dst_port'), log.get('protocol'))
+
     for key in ('timestamp', 'created_at', 'abuse_last_reported'):
         if log.get(key):
             log[key] = log[key].isoformat()
@@ -368,7 +400,8 @@ def get_log_counts_by_type():
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT log_type, COUNT(*) FROM logs WHERE log_type IN ('wifi', 'system') GROUP BY log_type"
+                "SELECT log_type_id, COUNT(*) FROM logs WHERE log_type_id IN (%s, %s) GROUP BY log_type_id",
+                [lookups.log_type_id('wifi'), lookups.log_type_id('system')],
             )
             rows = cur.fetchall()
         conn.commit()
@@ -378,7 +411,7 @@ def get_log_counts_by_type():
         raise HTTPException(status_code=500, detail="Failed to query log counts") from e
     finally:
         put_conn(conn)
-    counts = {r[0]: r[1] for r in rows}
+    counts = {lookups.log_type_text(r[0]): r[1] for r in rows}
     return {"wifi": counts.get("wifi", 0), "system": counts.get("system", 0)}
 
 
@@ -496,7 +529,7 @@ def export_csv_endpoint(
         with conn.cursor() as cur:
             cur.execute(
                 f"""WITH filtered AS (
-                        SELECT * FROM logs WHERE {where}
+                        SELECT * FROM logs_text WHERE {where}
                         ORDER BY timestamp DESC LIMIT %s
                     )
                     SELECT {', '.join('f.' + c for c in export_columns)},
@@ -569,7 +602,7 @@ def get_services():
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT DISTINCT service_name
-                FROM logs
+                FROM logs_text
                 WHERE service_name IS NOT NULL
                   AND timestamp > now() - interval '36 hours'
                 ORDER BY service_name
@@ -594,7 +627,7 @@ def get_protocols():
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT DISTINCT protocol
-                FROM logs
+                FROM logs_text
                 WHERE protocol IS NOT NULL
                   AND timestamp > now() - interval '36 hours'
                 ORDER BY protocol

@@ -8,7 +8,6 @@ Background daemon thread that:
 2. Processes the threat_backfill_queue (deferred AbuseIPDB lookups)
 3. Runs targeted log patching only for IPs whose threat data changed
 4. Performs low-priority stale threat re-enrichment
-5. Runs one-shot service-name migration with ID cursor
 """
 
 import time
@@ -17,14 +16,14 @@ import threading
 
 from psycopg2 import extras
 
-from services import get_service_mappings
+import lookups
+
 
 logger = logging.getLogger('backfill')
 
 QUEUE_WORKER_INTERVAL = 300       # 5 minutes
 QUEUE_BATCH_SIZE = 50             # IPs per queue pass
 STALE_REENRICH_BATCH = 10         # Stale IPs per pass
-SERVICE_NAME_BATCH_SIZE = 1000    # Rows per service-name cursor batch
 RULE_ACTION_BATCH_SIZE = 500      # Rows per rule-action cursor batch
 
 
@@ -68,7 +67,6 @@ class BackfillTask:
         self._fix_abuse_hostname_mixing()
 
         # One-shot migrations (ID cursor, persisted progress)
-        self._service_name_migration()
         self._backfill_rule_action()
         self._orphan_queue_seed()
 
@@ -213,48 +211,6 @@ class BackfillTask:
 
     # ── One-shot service-name migration ───────────────────────────────────────
 
-    def _service_name_migration(self):
-        """One-shot ID-cursor migration for historical service_name gaps.
-
-        Persists cursor position in system_config. Stops when complete.
-        """
-        from db import get_config, set_config
-
-        if get_config(self.db, 'service_name_backfill_done', False):
-            return
-
-        last_id = get_config(self.db, 'service_name_backfill_last_id', 0) or 0
-        service_map = get_service_mappings()
-        total_patched = 0
-
-        # Process one batch per cycle to avoid blocking
-        rows = self.db.service_name_backfill_batch(last_id, SERVICE_NAME_BATCH_SIZE)
-        if not rows:
-            # No more rows — mark as done
-            set_config(self.db, 'service_name_backfill_done', True)
-            logger.info("Service-name backfill complete (cursor at id=%d)", last_id)
-            return
-
-        updates = []
-        for row_id, dst_port, protocol in rows:
-            last_id = row_id
-            proto = (protocol or '').lower()
-            name = service_map.get((dst_port, proto))
-            if name:
-                updates.append((row_id, name))
-
-        if updates:
-            total_patched = self.db.patch_service_names(updates)
-
-        # Persist cursor
-        set_config(self.db, 'service_name_backfill_last_id', last_id)
-
-        if total_patched > 0 or len(rows) > 0:
-            logger.debug("Service-name migration: %d patched in batch (cursor at id=%d)",
-                         total_patched, last_id)
-
-    # ── One-shot rule_action backfill for zone_index format rules ────────────
-
     def _backfill_rule_action(self):
         """One-shot ID-cursor repair for zone_index format rules stored with wrong rule_action.
 
@@ -288,7 +244,7 @@ class BackfillTask:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT id, rule_name, rule_desc, rule_action, interface_in, interface_out "
-                    "FROM logs "
+                    "FROM logs_text "
                     "WHERE id > %s "
                     "  AND log_type = 'firewall' "
                     "  AND rule_name ~ '^[A-Z][A-Z0-9]*_[A-Z][A-Z0-9]*-[0-9]+$' "
@@ -323,8 +279,8 @@ class BackfillTask:
                 with conn.cursor() as cur:
                     extras.execute_batch(
                         cur,
-                        "UPDATE logs SET rule_action = %s WHERE id = %s",
-                        [(action, row_id) for row_id, action in updates]
+                        "UPDATE logs SET rule_action_id = %s WHERE id = %s",
+                        [(lookups.rule_action_id(action), row_id) for row_id, action in updates]
                     )
                     conn.commit()
             logger.debug("Rule-action backfill: %d rows patched in batch (cursor at id=%d)",
@@ -356,7 +312,7 @@ class BackfillTask:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT id, host(src_ip) as src, host(dst_ip) as dst "
-                    "FROM logs "
+                    "FROM logs_text "
                     "WHERE id > %s "
                     "  AND log_type = 'firewall' "
                     "  AND rule_action = 'block' "
@@ -433,7 +389,7 @@ class BackfillTask:
                     cur.execute("""
                         SELECT id, interface_in, interface_out, rule_name,
                                src_ip::text, dst_ip::text
-                        FROM logs
+                        FROM logs_text
                         WHERE log_type = 'firewall' AND id > %s
                         ORDER BY id
                         LIMIT %s
@@ -457,8 +413,9 @@ class BackfillTask:
             with self.db.get_conn() as conn:
                 with conn.cursor() as cur:
                     extras.execute_batch(cur,
-                        "UPDATE logs SET direction = %s WHERE id = %s",
-                        updates, page_size=500
+                        "UPDATE logs SET direction_id = %s WHERE id = %s",
+                        [(lookups.direction_id(d), row_id) for d, row_id in updates],
+                        page_size=500
                     )
 
             total_updated += len(updates)
@@ -501,7 +458,7 @@ class BackfillTask:
                 with conn.cursor() as cur:
                     cur.execute("""
                         SELECT id, host(dst_ip) as dst_ip
-                        FROM logs
+                        FROM logs_text
                         WHERE log_type = 'firewall'
                           AND src_ip = ANY(%s::inet[])
                           AND geo_country IS NOT NULL
@@ -633,7 +590,7 @@ class BackfillTask:
                 with conn.cursor(cursor_factory=RealDictCursor) as cur:
                     cur.execute("""
                         SELECT id, host(src_ip) as src_ip
-                        FROM logs
+                        FROM logs_text
                         WHERE dst_ip = ANY(%s::inet[])
                           AND direction IN ('inbound', 'in')
                           AND src_ip != ALL(%s::inet[])

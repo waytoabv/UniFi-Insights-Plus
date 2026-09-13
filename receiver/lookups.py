@@ -108,6 +108,22 @@ def closed_ids_matching(kind, pattern):
     return [v for text, v in CLOSED_SETS[kind].items() if matcher(text)]
 
 
+def sql_values_clause(kind: str) -> str:
+    """A `(VALUES (id,'name'), ...)` list for a closed set.
+
+    Generated rather than written out in the view definition so the SQL cannot
+    drift from CLOSED_SETS. Values are asserted to be plain identifiers, which
+    they are by construction — this is a guard against a future member with a
+    quote in it, not against user input.
+    """
+    rows = []
+    for name, value in CLOSED_SETS[kind].items():
+        if not re.fullmatch(r'[a-z_]+', name):
+            raise ValueError(f"closed-set member {name!r} is not a bare identifier")
+        rows.append(f"({value},'{name}')")
+    return f"(VALUES {', '.join(rows)})"
+
+
 # ── Matching ─────────────────────────────────────────────────────────────────
 
 def _matcher(pattern):

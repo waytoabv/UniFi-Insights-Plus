@@ -113,6 +113,31 @@ def get_service_description(port: Optional[int], protocol: Optional[str] = 'tcp'
     normalized_protocol = (protocol or 'tcp').lower()
     return _SERVICE_DESC_MAP.get((port, normalized_protocol))
 
+def ports_for_service(name: str) -> list[int]:
+    """Destination ports that resolve to this service name.
+
+    The reverse of get_service_name, used by the `service` filter now that
+    service_name is no longer a stored column: a filter for "https" becomes
+    `dst_port IN (443, ...)`, which hits the port index instead of scanning a
+    text column.
+
+    Matching is case-insensitive and covers the display overrides, so the name
+    the UI shows is the name that filters.
+    """
+    if not name:
+        return []
+    wanted = name.strip().lower()
+    ports = {
+        port for (port, _proto), service in _SERVICE_MAP.items()
+        if service and service.lower() == wanted
+    }
+    ports.update(
+        port for (port, _proto), service in _SERVICE_MAP.items()
+        if _DISPLAY_OVERRIDES.get(service, service).lower() == wanted
+    )
+    return sorted(ports)
+
+
 def get_service_name(port: Optional[int], protocol: Optional[str] = 'tcp') -> Optional[str]:
     """
     Return IANA service name for the given port and protocol.

@@ -656,10 +656,12 @@ class FakeRetentionCursor:
 
     def execute(self, sql, params=None):
         if sql and 'DELETE' in sql:
-            if "log_type = 'dns'" in sql and "!=" not in sql:
-                label = 'dns'
-            else:
+            # The DNS pass filters on equality; the general pass uses
+            # IS DISTINCT FROM so rows with an unresolved type still age out.
+            if 'IS DISTINCT FROM' in sql:
                 label = 'non_dns'
+            else:
+                label = 'dns'
             remaining = self._conn._remaining[label]
             batch = min(remaining, self._conn._batch_size)
             self._conn._remaining[label] -= batch

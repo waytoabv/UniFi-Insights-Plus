@@ -1,113 +1,161 @@
 -- UniFi Log Insight schema
 
+-- ── Lookup tables ────────────────────────────────────────────────────────────
+-- Low-cardinality text is stored once here and referenced by a SMALLINT from
+-- logs. Measured on a live install at 61 rows/s: rule_name and rule_desc alone
+-- accounted for 53 of 473 heap bytes per row, across 41 and 48 distinct values.
+--
+-- These hold values that arrive from the network, so one never seen before must
+-- not lose data — it is assigned an id on first sight. Closed sets produced by
+-- our own parsers (log_type, rule_action, direction) are constants in
+-- receiver/lookups.py instead.
+
+CREATE TABLE IF NOT EXISTS rules (
+    id     SMALLINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name   VARCHAR(100),
+    descr  VARCHAR(255)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rules_key
+    ON rules (COALESCE(lower(name), ''), COALESCE(lower(descr), ''));
+
+CREATE TABLE IF NOT EXISTS interfaces (
+    id     SMALLINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name   VARCHAR(20) NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_interfaces_key ON interfaces (lower(name));
+
+CREATE TABLE IF NOT EXISTS device_names (
+    id     SMALLINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name   TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_device_names_key ON device_names (lower(name));
+
+CREATE TABLE IF NOT EXISTS protocols (
+    id     SMALLINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name   VARCHAR(10) NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_protocols_key ON protocols (lower(name));
+
+-- IANA service names, so the logs_text view can resolve service_name without
+-- the column being stored per row. Filled at start-up from the bundled CSV.
+CREATE TABLE IF NOT EXISTS services (
+    port   INTEGER NOT NULL,
+    proto  VARCHAR(10) NOT NULL,
+    name   TEXT NOT NULL,
+    PRIMARY KEY (port, proto)
+);
+
+-- ── Logs ─────────────────────────────────────────────────────────────────────
+-- Column order follows alignment: 8-byte types, then 4, then 2, then variable
+-- length. PostgreSQL pads each column to its own boundary, and at this ingest
+-- rate the padding of an arbitrary order is measurable.
+--
+-- The *_id columns reference the lookup tables above but carry no foreign keys.
+-- Those tables are append-only and written solely through lookups.LookupTable,
+-- and logs_text resolves them with LEFT JOINs, so a dangling id degrades to
+-- NULL rather than breaking a read. Ten FK checks on the hottest path in the
+-- system is a poor trade for a constraint nothing can violate.
 CREATE TABLE IF NOT EXISTS logs (
-    id          BIGSERIAL PRIMARY KEY,
-    timestamp   TIMESTAMPTZ NOT NULL,
-    log_type    VARCHAR(20) NOT NULL,  -- firewall, dhcp, dns, wifi, ids
-    direction   VARCHAR(20),           -- inbound, outbound, inter_vlan, nat
-    src_ip      INET,
-    src_port    INTEGER,
-    dst_ip      INET,
-    dst_port    INTEGER,
-    protocol    VARCHAR(10),
-    service_name TEXT,
-    rule_name   VARCHAR(100),
-    rule_desc   VARCHAR(255),
-    rule_action VARCHAR(20),           -- allow, block, redirect
-    interface_in  VARCHAR(20),
-    interface_out VARCHAR(20),
-    mac_address MACADDR,
-    hostname    VARCHAR(255),
-    dns_query   VARCHAR(255),
-    dns_type    VARCHAR(10),
-    dns_answer  VARCHAR(255),
-    dhcp_event  VARCHAR(20),           -- DHCPACK, DHCPDISCOVER, DHCPOFFER, DHCPREQUEST
-    wifi_event  VARCHAR(50),
-    geo_country VARCHAR(2),
-    geo_city    VARCHAR(100),
-    geo_lat     DECIMAL(9,6),
-    geo_lon     DECIMAL(9,6),
-    asn_number  INTEGER,
-    asn_name    VARCHAR(255),
-    threat_score    INTEGER,           -- 0-100 from AbuseIPDB
-    threat_categories TEXT[],
-    rdns        VARCHAR(255),
-    abuse_usage_type TEXT,
-    abuse_hostnames TEXT,
-    abuse_total_reports INTEGER,
-    abuse_last_reported TIMESTAMPTZ,
+    id                   BIGSERIAL PRIMARY KEY,
+    timestamp            TIMESTAMPTZ NOT NULL,
+    abuse_last_reported  TIMESTAMPTZ,
+    src_port             INTEGER,
+    dst_port             INTEGER,
+    asn_number           INTEGER,
+    threat_score         INTEGER,           -- 0-100 from AbuseIPDB
+    abuse_total_reports  INTEGER,
+    log_type_id          SMALLINT,          -- lookups.CLOSED_SETS['log_type']
+    direction_id         SMALLINT,          -- lookups.CLOSED_SETS['direction']
+    rule_id              SMALLINT,          -- → rules
+    rule_action_id       SMALLINT,          -- lookups.CLOSED_SETS['rule_action']
+    protocol_id          SMALLINT,          -- → protocols
+    iface_in_id          SMALLINT,          -- → interfaces
+    iface_out_id         SMALLINT,          -- → interfaces
+    hostname_id          SMALLINT,          -- → device_names
+    src_device_id        SMALLINT,          -- → device_names
+    dst_device_id        SMALLINT,          -- → device_names
     abuse_is_whitelisted BOOLEAN,
-    abuse_is_tor BOOLEAN,
-    src_device_name TEXT,
-    dst_device_name TEXT,
-    raw_log     TEXT NOT NULL,
-    created_at  TIMESTAMPTZ DEFAULT NOW()
+    abuse_is_tor         BOOLEAN,
+    src_ip               INET,
+    dst_ip               INET,
+    remote_ip            INET,
+    mac_address          MACADDR,
+    geo_country          VARCHAR(2),
+    geo_city             VARCHAR(100),
+    geo_lat              DECIMAL(9,6),
+    geo_lon              DECIMAL(9,6),
+    asn_name             VARCHAR(255),
+    threat_categories    TEXT[],
+    rdns                 VARCHAR(255),
+    abuse_usage_type     TEXT,
+    abuse_hostnames      TEXT,
+    dns_query            VARCHAR(255),
+    dns_type             VARCHAR(10),
+    dns_answer           VARCHAR(255),
+    dhcp_event           VARCHAR(20),
+    wifi_event           VARCHAR(50),
+    -- Only populated for lines the parser could not read, where it is the only
+    -- record of what arrived. STORE_RAW_LOG=always keeps it for every row.
+    raw_log              TEXT
 );
 
 -- Performance indexes
 CREATE INDEX IF NOT EXISTS idx_logs_timestamp    ON logs (timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_logs_src_ip       ON logs (src_ip);
 CREATE INDEX IF NOT EXISTS idx_logs_dst_ip       ON logs (dst_ip);
-CREATE INDEX IF NOT EXISTS idx_logs_direction    ON logs (direction);
+CREATE INDEX IF NOT EXISTS idx_logs_direction    ON logs (direction_id);
 CREATE INDEX IF NOT EXISTS idx_logs_threat_score ON logs (threat_score) WHERE threat_score IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_logs_service_name ON logs (service_name) WHERE service_name IS NOT NULL;
 
 -- Composite index for common filtered queries
-CREATE INDEX IF NOT EXISTS idx_logs_type_time    ON logs (log_type, timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_logs_action_time  ON logs (rule_action, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_logs_type_time    ON logs (log_type_id, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_logs_action_time  ON logs (rule_action_id, timestamp DESC);
 
 -- Composite index for flow aggregation (Sankey + IP Pairs)
 CREATE INDEX IF NOT EXISTS idx_logs_flow_agg
-    ON logs (timestamp DESC, src_ip, dst_ip, dst_port, protocol)
-    WHERE log_type = 'firewall' AND src_ip IS NOT NULL AND dst_ip IS NOT NULL;
+    ON logs (timestamp DESC, src_ip, dst_ip, dst_port, protocol_id)
+    WHERE log_type_id = 1 AND src_ip IS NOT NULL AND dst_ip IS NOT NULL;
 
 -- Zone matrix aggregation (interface-to-interface traffic)
 CREATE INDEX IF NOT EXISTS idx_logs_zone_matrix
-    ON logs (timestamp DESC, interface_in, interface_out, rule_action)
-    WHERE log_type = 'firewall' AND interface_in IS NOT NULL AND interface_out IS NOT NULL;
+    ON logs (timestamp DESC, iface_in_id, iface_out_id, rule_action_id)
+    WHERE log_type_id = 1 AND iface_in_id IS NOT NULL AND iface_out_id IS NOT NULL;
 
 -- Indexes for newly exposed filters
-CREATE INDEX IF NOT EXISTS idx_logs_src_port     ON logs (src_port) WHERE src_port IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_logs_dst_port     ON logs (dst_port) WHERE dst_port IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_logs_protocol     ON logs (protocol) WHERE protocol IS NOT NULL;
 
 -- Targeted backfill indexes (issue #67: avoid full-table scans)
 CREATE INDEX IF NOT EXISTS idx_logs_fw_block_null_threat_src
     ON logs (src_ip)
-    WHERE log_type = 'firewall' AND rule_action = 'block'
+    WHERE log_type_id = 1 AND rule_action_id = 2
       AND threat_score IS NULL AND src_ip IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_logs_fw_block_null_threat_dst
     ON logs (dst_ip)
-    WHERE log_type = 'firewall' AND rule_action = 'block'
+    WHERE log_type_id = 1 AND rule_action_id = 2
       AND threat_score IS NULL AND dst_ip IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_logs_fw_block_missing_abuse_src
     ON logs (src_ip)
-    WHERE log_type = 'firewall' AND rule_action = 'block'
+    WHERE log_type_id = 1 AND rule_action_id = 2
       AND threat_score IS NOT NULL AND abuse_usage_type IS NULL AND src_ip IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_logs_fw_block_missing_abuse_dst
     ON logs (dst_ip)
-    WHERE log_type = 'firewall' AND rule_action = 'block'
+    WHERE log_type_id = 1 AND rule_action_id = 2
       AND threat_score IS NOT NULL AND abuse_usage_type IS NULL AND dst_ip IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_logs_fw_service_name_null_id
-    ON logs (id)
-    WHERE log_type = 'firewall' AND service_name IS NULL AND dst_port IS NOT NULL;
 
 -- SP-GiST index for WAN IP detection queries (Issue 72 fallback)
 CREATE INDEX IF NOT EXISTS idx_logs_spgist_dst_ip_firewall
     ON logs USING spgist (dst_ip)
-    WHERE log_type = 'firewall';
+    WHERE log_type_id = 1;
 
--- Composite index for type-scoped purge batches and COUNT/MAX snapshots.
--- Enables O(N) batch scans for DELETE … WHERE log_type = X AND id <= Y LIMIT N
--- instead of O(total-rows-of-type) heap-sorts on large tables.
-CREATE INDEX IF NOT EXISTS idx_logs_type_id ON logs (log_type, id);
+-- (idx_logs_type_id was removed: 319 MB of index serving one measured
+-- scan in a day, for an occasional admin purge. The purge now falls
+-- back to a sequential scan over the rows of that type.)
 
 -- Partial index for non-DNS retention cleanup batches.
--- The non-DNS pass deletes WHERE log_type != 'dns' AND timestamp < cutoff.
+-- The non-DNS pass deletes WHERE log_type_id IS DISTINCT FROM 2 AND timestamp < cutoff.
 -- Without this index the pass falls back to a sequential scan on large tables.
 CREATE INDEX IF NOT EXISTS idx_logs_nondns_timestamp
     ON logs (timestamp DESC)
-    WHERE log_type != 'dns';
+    WHERE log_type_id IS DISTINCT FROM 2;
 
 -- AbuseIPDB threat score cache (persistent across restarts)
 CREATE TABLE IF NOT EXISTS ip_threats (

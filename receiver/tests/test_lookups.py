@@ -247,3 +247,21 @@ class TestLookupTableReload:
         db.rows = [(1, 'eth0')]
         t.reload()
         assert t.text_for(2) is None
+
+
+class TestSqlValuesClause:
+    """The compatibility view builds its closed-set joins from CLOSED_SETS, so
+    the SQL cannot drift from the Python mapping."""
+
+    def test_contains_every_member(self):
+        clause = lookups.sql_values_clause('rule_action')
+        for name, value in CLOSED_SETS['rule_action'].items():
+            assert f"({value},'{name}')" in clause
+
+    def test_is_a_values_list(self):
+        assert lookups.sql_values_clause('direction').startswith('(VALUES ')
+
+    def test_rejects_a_member_that_would_need_quoting(self, monkeypatch):
+        monkeypatch.setitem(CLOSED_SETS, 'bogus', {"o'brien": 1})
+        with pytest.raises(ValueError):
+            lookups.sql_values_clause('bogus')

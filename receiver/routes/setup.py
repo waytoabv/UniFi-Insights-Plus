@@ -12,6 +12,7 @@ from psycopg2.extras import RealDictCursor, Json
 
 from db import Database, get_config, set_config, count_logs, encrypt_api_key, decrypt_api_key, parse_retention_time
 from deps import get_conn, put_conn, enricher_db, unifi_api, signal_receiver, APP_VERSION, ttl_cache
+import lookups
 from unifi_api import UniFiAPI
 from firewall_policy_matcher import invalidate_cache as invalidate_fw_cache
 from parsers import (
@@ -114,13 +115,13 @@ def network_segments(wan_interfaces: Optional[str] = None):
             cur.execute("""
                 WITH interface_ips AS (
                     SELECT interface_in as iface, src_ip
-                    FROM logs
+                    FROM logs_text
                     WHERE log_type = 'firewall'
                       AND interface_in IS NOT NULL
                       AND NOT is_public_inet(src_ip)
                     UNION
                     SELECT interface_out as iface, dst_ip as src_ip
-                    FROM logs
+                    FROM logs_text
                     WHERE log_type = 'firewall'
                       AND interface_out IS NOT NULL
                       AND NOT is_public_inet(dst_ip)
@@ -327,7 +328,7 @@ def _get_recent_log_interfaces():
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT DISTINCT unnest(ARRAY[interface_in, interface_out]) as iface
-                FROM logs
+                FROM logs_text
                 WHERE log_type = 'firewall'
                   AND timestamp > now() - interval '36 hours'
                   AND (interface_in IS NOT NULL OR interface_out IS NOT NULL)
@@ -907,10 +908,10 @@ def _run_purge(log_type: str, total_rows: int, max_id: int):
                 try:
                     cur.execute(
                         "DELETE FROM logs WHERE id IN ("
-                        "  SELECT id FROM logs WHERE log_type = %s AND id <= %s"
+                        "  SELECT id FROM logs WHERE log_type_id = %s AND id <= %s"
                         "  ORDER BY id FOR UPDATE SKIP LOCKED LIMIT %s"
                         ")",
-                        [log_type, max_id, batch_size]
+                        [lookups.log_type_id(log_type), max_id, batch_size]
                     )
                     batch = cur.rowcount
                     conn.commit()
@@ -969,7 +970,8 @@ def purge_logs_by_type(log_type: str):
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*), MAX(id) FROM logs WHERE log_type = %s", [log_type])
+            cur.execute("SELECT COUNT(*), MAX(id) FROM logs WHERE log_type_id = %s",
+                        [lookups.log_type_id(log_type)])
             total_rows, max_id = cur.fetchone()
         conn.commit()
     finally:

@@ -229,7 +229,7 @@ def get_flow_graph(
            ({dim_b_expr})::text AS b,
            ({dim_c_expr})::text AS c,
            COUNT(*) AS value
-    FROM logs
+    FROM logs_text
     WHERE {where}
       AND src_ip IS NOT NULL AND dst_ip IS NOT NULL
       {ip_filter}
@@ -314,7 +314,7 @@ def get_zone_matrix(
         COUNT(*) FILTER (WHERE rule_action = 'allow') AS allow_count,
         COUNT(*) FILTER (WHERE rule_action = 'block') AS block_count,
         COUNT(DISTINCT (host(src_ip) || '-' || host(dst_ip))) AS unique_pairs
-    FROM logs
+    FROM logs_text
     WHERE {where}
       AND interface_in IS NOT NULL AND interface_out IS NOT NULL
     GROUP BY interface_in, interface_out
@@ -401,7 +401,7 @@ def get_host_detail(
                     MAX(timestamp) AS last_seen,
                     MAX(asn_name) AS asn_name,
                     MAX(rdns) AS rdns
-                FROM logs
+                FROM logs_text
                 WHERE {host_where}
             """, [ip] + host_params)
             summary = dict(cur.fetchone())
@@ -452,7 +452,7 @@ def get_host_detail(
                        COUNT(*) FILTER (WHERE rule_action = 'block') AS block_count,
                        MAX(asn_name) AS asn_name,
                        MAX(rdns) AS rdns
-                FROM logs
+                FROM logs_text
                 WHERE {src_where} AND dst_ip IS NOT NULL
                 GROUP BY dst_ip
                 ORDER BY count DESC
@@ -470,7 +470,7 @@ def get_host_detail(
                        COUNT(*) FILTER (WHERE rule_action = 'block') AS block_count,
                        MAX(asn_name) AS asn_name,
                        MAX(rdns) AS rdns
-                FROM logs
+                FROM logs_text
                 WHERE {dst_where} AND src_ip IS NOT NULL
                 GROUP BY src_ip
                 ORDER BY count DESC
@@ -498,7 +498,7 @@ def get_host_detail(
                 SELECT dst_port, COALESCE(service_name, 'Unknown') AS service_name,
                        COALESCE(LOWER(protocol), 'unknown') AS protocol,
                        COUNT(*) AS count
-                FROM logs
+                FROM logs_text
                 WHERE {host_where}
                   AND dst_port IS NOT NULL
                 GROUP BY dst_port, service_name, protocol

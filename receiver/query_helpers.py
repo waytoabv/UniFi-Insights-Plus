@@ -6,7 +6,55 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import lookups
+import services
+
 logger = logging.getLogger(__name__)
+
+# Lookup tables, injected by deps.py once the database is connected.
+#
+# Filters resolve text to id lists here in Python rather than joining in SQL.
+# The tables hold tens of rows, so the resolution is a dict scan, and doing it
+# outside SQL keeps the glob and substring semantics the text columns had.
+_LOOKUPS = None
+
+
+def set_lookups(lk):
+    """Bind the lookup tables. Called once at start-up, and by tests."""
+    global _LOOKUPS
+    _LOOKUPS = lk
+
+
+def _table(name):
+    """One lookup table, or None before injection (routes guard against that)."""
+    return getattr(_LOOKUPS, name, None) if _LOOKUPS is not None else None
+
+
+def _ids_matching(table_name, pattern):
+    """Ids in a lookup table whose text matches the pattern."""
+    table = _table(table_name)
+    return table.ids_matching(pattern) if table is not None else []
+
+
+def _id_condition(column, ids, negated=False):
+    """An IN / NOT IN test over resolved ids, as (sql, params).
+
+    An empty id list means the pattern matched no known value. For a positive
+    filter that is an empty result; for a negated one it is no restriction at
+    all — the same outcome the text columns produced.
+    """
+    if not ids:
+        return ("1=0", []) if not negated else ("1=1", [])
+    placeholders = ','.join(['%s'] * len(ids))
+    if negated:
+        return (f"({column} NOT IN ({placeholders}) OR {column} IS NULL)", list(ids))
+    return (f"{column} IN ({placeholders})", list(ids))
+
+
+def _add_id_filter(conditions, params, column, ids, negated=False):
+    sql, bound = _id_condition(column, ids, negated)
+    conditions.append(sql)
+    params.extend(bound)
 
 # Single source of truth for valid time ranges and their deltas
 _TIME_RANGE_DELTAS = {
@@ -140,9 +188,8 @@ def build_log_query(
 
     if log_type:
         types = [t.strip() for t in log_type.split(',')]
-        placeholders = ','.join(['%s'] * len(types))
-        conditions.append(f"log_type IN ({placeholders})")
-        params.extend(types)
+        ids = [i for i in (lookups.log_type_id(t) for t in types) if i is not None]
+        _add_id_filter(conditions, params, 'log_type_id', ids)
 
     time_conds, time_params = build_time_conditions(time_range, time_from, time_to)
     conditions.extend(time_conds)
@@ -184,55 +231,48 @@ def build_log_query(
         # VPN↔LAN traffic isn't excluded by the direction filter.
         if vpn_only and 'vpn' not in directions:
             directions.append('vpn')
-        placeholders = ','.join(['%s'] * len(directions))
-        conditions.append(f"direction IN ({placeholders})")
-        params.extend(directions)
+        ids = [i for i in (lookups.direction_id(d) for d in directions) if i is not None]
+        _add_id_filter(conditions, params, 'direction_id', ids)
 
     if rule_action:
         negated, val = _parse_negation(rule_action)
         actions = [a.strip() for a in val.split(',')]
+        # 'unknown' is not a stored value — it means "no action recorded", so it
+        # maps to NULL rather than to an id.
         has_unknown = 'unknown' in actions
-        known_actions = [a for a in actions if a != 'unknown']
+        ids = [i for i in (lookups.rule_action_id(a) for a in actions if a != 'unknown')
+               if i is not None]
         if negated:
-            placeholders = ','.join(['%s'] * len(known_actions))
-            if has_unknown and known_actions:
-                conditions.append(f"(rule_action NOT IN ({placeholders}) AND rule_action IS NOT NULL)")
+            placeholders = ','.join(['%s'] * len(ids))
+            if has_unknown and ids:
+                conditions.append(f"(rule_action_id NOT IN ({placeholders}) AND rule_action_id IS NOT NULL)")
             elif has_unknown:
-                conditions.append("rule_action IS NOT NULL")
+                conditions.append("rule_action_id IS NOT NULL")
+            elif ids:
+                conditions.append(f"(rule_action_id NOT IN ({placeholders}) OR rule_action_id IS NULL)")
             else:
-                conditions.append(f"(rule_action NOT IN ({placeholders}) OR rule_action IS NULL)")
-            params.extend(known_actions)
+                conditions.append("1=1")
+            params.extend(ids)
         else:
             parts = []
-            if known_actions:
-                placeholders = ','.join(['%s'] * len(known_actions))
-                parts.append(f"rule_action IN ({placeholders})")
-                params.extend(known_actions)
+            if ids:
+                placeholders = ','.join(['%s'] * len(ids))
+                parts.append(f"rule_action_id IN ({placeholders})")
+                params.extend(ids)
             if has_unknown:
-                parts.append("rule_action IS NULL")
-            conditions.append(f"({' OR '.join(parts)})")
+                parts.append("rule_action_id IS NULL")
+            conditions.append(f"({' OR '.join(parts)})" if parts else "1=0")
 
     if rule_name:
         negated, val = _parse_negation(rule_name)
-        escaped = _escape_like(val)
-        # The UI adds a space after ']' for display (e.g. "[WAN_LOCAL] Allow All Traffic")
-        # but the DB stores it without the space ("[WAN_LOCAL]Allow All Traffic").
-        # Normalize by also trying the value with '] ' collapsed to ']'.
-        escaped_norm = _escape_like(val.replace('] ', ']'))
-        if negated:
-            conditions.append(
-                "(rule_name NOT ILIKE %s ESCAPE '\\' OR rule_name IS NULL)"
-                " AND (rule_desc NOT ILIKE %s ESCAPE '\\' OR rule_desc IS NULL)"
-                " AND (rule_desc NOT ILIKE %s ESCAPE '\\' OR rule_desc IS NULL)"
-            )
-            params.extend([f"%{escaped}%", f"%{escaped}%", f"%{escaped_norm}%"])
-        else:
-            conditions.append(
-                "(rule_name ILIKE %s ESCAPE '\\'"
-                " OR rule_desc ILIKE %s ESCAPE '\\'"
-                " OR rule_desc ILIKE %s ESCAPE '\\')"
-            )
-            params.extend([f"%{escaped}%", f"%{escaped}%", f"%{escaped_norm}%"])
+        # The UI adds a space after ']' for display ("[WAN_LOCAL] Allow All")
+        # while the gateway sends it without ("[WAN_LOCAL]Allow All"), so both
+        # spellings are tried. Matching runs over the rules table, which covers
+        # name and description in one pass.
+        ids = set(_ids_matching('rules', val))
+        if '] ' in val:
+            ids |= set(_ids_matching('rules', val.replace('] ', ']')))
+        _add_id_filter(conditions, params, 'rule_id', sorted(ids), negated)
 
     if country:
         negated, val = _parse_negation(country)
@@ -251,28 +291,37 @@ def build_log_query(
 
     if search:
         negated, val = _parse_negation(search)
-        op = "NOT ILIKE" if negated else "ILIKE"
-        escaped = _escape_like(val)
-        conditions.append(f"raw_log {op} %s ESCAPE '\\'")
-        params.append(f"%{escaped}%")
+        sql, bound = _search_condition(val, negated)
+        conditions.append(sql)
+        params.extend(bound)
 
     if service:
         negated, val = _parse_negation(service)
-        services = [s.strip() for s in val.split(',')]
-        placeholders = ','.join(['%s'] * len(services))
-        keyword = "NOT IN" if negated else "IN"
-        condition = f"service_name {keyword} ({placeholders})"
-        if negated:
-            condition = f"({condition} OR service_name IS NULL)"
-        conditions.append(condition)
-        params.extend(services)
+        # service_name is no longer stored — it is a function of dst_port, so the
+        # filter resolves to the ports that carry the service. That hits the port
+        # index instead of scanning a text column.
+        ports = sorted({
+            port
+            for name in val.split(',')
+            for port in services.ports_for_service(name.strip())
+        })
+        _add_id_filter(conditions, params, 'dst_port', ports, negated)
 
     if interface:
-        ifaces = [i.strip() for i in interface.split(',')]
-        placeholders = ','.join(['%s'] * len(ifaces))
-        conditions.append(f"(interface_in IN ({placeholders}) OR interface_out IN ({placeholders}))")
-        params.extend(ifaces)
-        params.extend(ifaces)  # Twice: once for interface_in, once for interface_out
+        ids = sorted({
+            i
+            for name in interface.split(',')
+            for i in _ids_matching('interfaces', name.strip())
+        })
+        if ids:
+            placeholders = ','.join(['%s'] * len(ids))
+            conditions.append(
+                f"(iface_in_id IN ({placeholders}) OR iface_out_id IN ({placeholders}))"
+            )
+            params.extend(ids)
+            params.extend(ids)  # Twice: once for each side
+        else:
+            conditions.append("1=0")
 
     if asn:
         negated, val = _parse_negation(asn)
@@ -304,26 +353,107 @@ def build_log_query(
 
     if protocol:
         negated, val = _parse_negation(protocol)
-        protocols = [p.strip().lower() for p in val.split(',')]
-        placeholders = ','.join(['%s'] * len(protocols))
-        keyword = "NOT IN" if negated else "IN"
-        condition = f"LOWER(protocol) {keyword} ({placeholders})"
-        if negated:
-            condition = f"({condition} OR protocol IS NULL)"
-        conditions.append(condition)
-        params.extend(protocols)
+        ids = sorted({
+            i
+            for name in val.split(',')
+            for i in _ids_matching('protocols', name.strip())
+        })
+        _add_id_filter(conditions, params, 'protocol_id', ids, negated)
 
     if vpn_only:
         from parsers import VPN_INTERFACE_PREFIXES
-        vpn_parts = []
-        for pfx in VPN_INTERFACE_PREFIXES:
-            vpn_parts.append("interface_in LIKE %s")
-            vpn_parts.append("interface_out LIKE %s")
-            params.extend([f"{pfx}%", f"{pfx}%"])
-        conditions.append(f"({' OR '.join(vpn_parts)})")
+        vpn_ids = sorted({
+            i
+            for pfx in VPN_INTERFACE_PREFIXES
+            for i in _ids_matching('interfaces', f"{pfx}*")
+        })
+        if vpn_ids:
+            placeholders = ','.join(['%s'] * len(vpn_ids))
+            conditions.append(
+                f"(iface_in_id IN ({placeholders}) OR iface_out_id IN ({placeholders}))"
+            )
+            params.extend(vpn_ids)
+            params.extend(vpn_ids)
+        else:
+            conditions.append("1=0")
 
     where = " AND ".join(conditions) if conditions else "1=1"
     return where, params
+
+
+# Text columns the free-text search covers directly.
+#
+# Everything displayed in the log table is searchable, which is the point: a
+# search for a country code, an ASN, a reverse-DNS name or a DNS query now
+# finds rows, where the previous raw_log-only search could only match what the
+# gateway happened to put on the wire.
+_SEARCH_TEXT_COLUMNS = (
+    'src_ip::text', 'dst_ip::text', 'rdns', 'geo_country', 'geo_city',
+    'asn_name', 'dns_query', 'dns_answer', 'dhcp_event', 'wifi_event',
+    'mac_address::text', 'src_port::text', 'dst_port::text',
+)
+
+# Lookup-backed columns: resolved to id lists in Python, then matched as IN.
+_SEARCH_LOOKUP_COLUMNS = (
+    ('rules', 'rule_id'),
+    ('protocols', 'protocol_id'),
+    ('interfaces', 'iface_in_id'),
+    ('interfaces', 'iface_out_id'),
+    ('device_names', 'src_device_id'),
+    ('device_names', 'dst_device_id'),
+    ('device_names', 'hostname_id'),
+)
+
+# Closed-set columns, matched against the words the UI displays.
+_SEARCH_CLOSED_COLUMNS = (
+    ('log_type', 'log_type_id'),
+    ('rule_action', 'rule_action_id'),
+    ('direction', 'direction_id'),
+)
+
+
+def _search_condition(value: str, negated: bool) -> tuple[str, list]:
+    """Free-text search across every displayed field.
+
+    Replaces the previous `raw_log ILIKE` search, which stopped working once
+    raw_log was no longer stored for parsed rows — and which could never match
+    anything the parser derived, such as a country, an ASN or a device name.
+
+    Text columns are matched in SQL; id-backed columns are resolved to id lists
+    here and matched as IN, so one pattern reaches both kinds in a single OR.
+    """
+    parts = []
+    params = []
+    escaped = f"%{_escape_like(value)}%"
+
+    for column in _SEARCH_TEXT_COLUMNS:
+        parts.append(f"{column} ILIKE %s ESCAPE '\\'")
+        params.append(escaped)
+
+    for table_name, column in _SEARCH_LOOKUP_COLUMNS:
+        ids = _ids_matching(table_name, value)
+        if ids:
+            placeholders = ','.join(['%s'] * len(ids))
+            parts.append(f"{column} IN ({placeholders})")
+            params.extend(ids)
+
+    for kind, column in _SEARCH_CLOSED_COLUMNS:
+        ids = [i for text, i in lookups.CLOSED_SETS[kind].items()
+               if value.lower() in text.lower()]
+        if ids:
+            placeholders = ','.join(['%s'] * len(ids))
+            parts.append(f"{column} IN ({placeholders})")
+            params.extend(ids)
+
+    # raw_log is only populated for lines the parser could not read, but those
+    # are exactly the ones with nothing else to search.
+    parts.append("raw_log ILIKE %s ESCAPE '\\'")
+    params.append(escaped)
+
+    clause = f"({' OR '.join(parts)})"
+    if negated:
+        return (f"NOT {clause}", params)
+    return (clause, params)
 
 
 def _escape_like(value: str) -> str:
