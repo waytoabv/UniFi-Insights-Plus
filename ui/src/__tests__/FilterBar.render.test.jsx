@@ -109,27 +109,56 @@ describe('chips', () => {
 })
 
 describe('search box', () => {
-  it('filters as you type', async () => {
+  const box = () => screen.getByPlaceholderText(/Filter —/)
+
+  it('filters as you type, before the term is kept', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true })
     const onChange = vi.fn()
     render(<FilterBar filters={BASE} onChange={onChange} />)
 
-    fireEvent.change(screen.getByPlaceholderText(/Filter —/), { target: { value: '443' } })
+    fireEvent.change(box(), { target: { value: '443' } })
     await vi.advanceTimersByTimeAsync(250)
 
     expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ search: '443' }))
     vi.useRealTimers()
   })
 
-  it('Enter submits immediately', () => {
+  it('Enter keeps the term and clears the box', () => {
     const onChange = vi.fn()
     render(<FilterBar filters={BASE} onChange={onChange} />)
 
-    const box = screen.getByPlaceholderText(/Filter —/)
-    fireEvent.change(box, { target: { value: '443' } })
-    fireEvent.keyDown(box, { key: 'Enter' })
+    fireEvent.change(box(), { target: { value: '443' } })
+    fireEvent.keyDown(box(), { key: 'Enter' })
 
     expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ search: '443' }))
+    expect(box()).toHaveValue('')
+  })
+
+  it('the next term is added, not substituted', () => {
+    const onChange = vi.fn()
+    render(<FilterBar filters={{ ...BASE, search: '443' }} onChange={onChange} />)
+
+    fireEvent.change(box(), { target: { value: 'tcp' } })
+    fireEvent.keyDown(box(), { key: 'Enter' })
+
+    expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ search: '443 tcp' }))
+  })
+
+  it('Escape drops the typed term and keeps the kept ones', () => {
+    const onChange = vi.fn()
+    render(<FilterBar filters={{ ...BASE, search: '443' }} onChange={onChange} />)
+
+    fireEvent.change(box(), { target: { value: 'tcp' } })
+    fireEvent.keyDown(box(), { key: 'Escape' })
+
+    expect(onChange).toHaveBeenLastCalledWith(expect.objectContaining({ search: '443' }))
+    expect(box()).toHaveValue('')
+  })
+
+  it('a term set from outside becomes a chip, leaving the box empty', () => {
+    render(<FilterBar filters={{ ...BASE, search: '10.0.0.1' }} onChange={vi.fn()} />)
+    expect(box()).toHaveValue('')
+    expect(screen.getByText('10.0.0.1')).toBeInTheDocument()
   })
 })
 

@@ -19,6 +19,36 @@ logger = logging.getLogger(__name__)
 # outside SQL keeps the glob and substring semantics the text columns had.
 _LOOKUPS = None
 
+# Whether to hide the collector's own syslog traffic, and what counts as it.
+# Injected the same way the lookups are, so all eight call sites of
+# build_log_query — log stream, aggregates, flows, threat map, dashboard —
+# pick it up without threading three more arguments through each one.
+_SYSLOG_FILTER = {'enabled': False, 'port': 514, 'ips': []}
+
+
+def set_syslog_filter(enabled: bool, port: int = 514, ips=None):
+    """Set the syslog-exclusion state. Called at start-up and on a settings change."""
+    _SYSLOG_FILTER['enabled'] = bool(enabled)
+    _SYSLOG_FILTER['port'] = int(port or 514)
+    _SYSLOG_FILTER['ips'] = list(ips or [])
+
+
+def refresh_syslog_filter(db):
+    """Re-read the syslog-exclusion setting from the database.
+
+    Called at start-up and whenever the switch is flipped. The collector's own
+    addresses are detected once per process — they change only with a restart.
+    """
+    from db import get_config
+    from net_identity import local_addresses
+
+    try:
+        enabled = get_config(db, 'ui_hide_syslog_traffic', 'off') == 'on'
+    except Exception:
+        logger.debug("Could not read ui_hide_syslog_traffic", exc_info=True)
+        enabled = False
+    set_syslog_filter(enabled, 514, local_addresses())
+
 
 def set_lookups(lk):
     """Bind the lookup tables. Called once at start-up, and by tests."""
@@ -184,6 +214,11 @@ def build_log_query(
     protocol: Optional[str] = None,
     since: Optional[int] = None,
     before_id: Optional[int] = None,
+    # Default to the injected setting; the explicit arguments exist so tests can
+    # drive the clause without touching module state.
+    hide_syslog: Optional[bool] = None,
+    syslog_port: Optional[int] = None,
+    syslog_collector_ips=None,
 ) -> tuple[str, list]:
     """Build WHERE clause and params from filters.
 
@@ -373,6 +408,16 @@ def build_log_query(
         else:
             conditions.append("1=0")
 
+    # Applied last so an explicit port filter above still stands: asking for
+    # 514 outright is a deliberate request to see it.
+    syslog_sql, syslog_params = syslog_exclusion(
+        _SYSLOG_FILTER['enabled'] if hide_syslog is None else hide_syslog,
+        _SYSLOG_FILTER['port'] if syslog_port is None else syslog_port,
+        _SYSLOG_FILTER['ips'] if syslog_collector_ips is None else syslog_collector_ips)
+    if syslog_sql:
+        conditions.append(syslog_sql)
+        params.extend(syslog_params)
+
     where = " AND ".join(conditions) if conditions else "1=1"
     return where, params
 
@@ -412,6 +457,35 @@ _SCOPE_COLUMNS = {
     'dst_port': ('dst_port',),
     'port': ('src_port', 'dst_port'),
 }
+
+
+def syslog_exclusion(enabled: bool, port: int, collector_ips) -> tuple:
+    """Hide the traffic that carries the logs themselves.
+
+    The gateway forwards its syslog to this host, and the firewall logs those
+    packets like any others. On a live install they were a visible share of
+    every view while describing nothing but the act of logging.
+
+    Narrowed to the collector's own addresses where they are known: the port
+    alone would also hide syslog between two other hosts, which is real traffic
+    the operator may want to see.
+
+    Returns (sql, params), or (None, []) when the setting is off.
+    """
+    if not enabled or not port:
+        return (None, [])
+
+    if collector_ips:
+        placeholders = ','.join(['%s'] * len(collector_ips))
+        clause = f"(dst_port = %s AND dst_ip IN ({placeholders}))"
+        params = [port, *collector_ips]
+    else:
+        clause = "(dst_port = %s)"
+        params = [port]
+
+    # COALESCE, not a bare NOT: dst_port is NULL for ICMP and for the non-firewall
+    # log types, and `NOT (NULL = 514)` is NULL, which would drop every one of them.
+    return (f"NOT COALESCE({clause}, FALSE)", params)
 
 
 def _address_filter(value: str, columns: tuple) -> tuple[str, list]:

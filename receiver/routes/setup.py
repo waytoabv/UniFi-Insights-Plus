@@ -13,6 +13,7 @@ from psycopg2.extras import RealDictCursor, Json
 from db import Database, get_config, set_config, count_logs, encrypt_api_key, decrypt_api_key, parse_retention_time
 from deps import get_conn, put_conn, enricher_db, unifi_api, signal_receiver, APP_VERSION, ttl_cache
 import lookups
+from query_helpers import refresh_syslog_filter
 from unifi_api import UniFiAPI
 from firewall_policy_matcher import invalidate_cache as invalidate_fw_cache
 from parsers import (
@@ -410,6 +411,11 @@ _UI_SETTINGS_DEFAULTS = {
     'ui_block_highlight': 'on',
     'ui_block_highlight_threshold': 0,
     'ui_csv_export_unifi_raw_log': 'off',
+    # The gateway's own syslog to this host is firewall traffic like any other,
+    # and at this ingest rate a visible share of every view. Hidden from the
+    # views, not from the database, so the switch takes effect immediately and
+    # nothing is lost by turning it on.
+    'ui_hide_syslog_traffic': 'off',
     'wifi_processing_enabled': True,
     'system_processing_enabled': True,
 }
@@ -421,6 +427,7 @@ _UI_SETTINGS_VALID = {
     'ui_block_highlight': {'on', 'off'},
     'ui_block_highlight_threshold': (0, 100),
     'ui_csv_export_unifi_raw_log': {'on', 'off'},
+    'ui_hide_syslog_traffic': {'on', 'off'},
     'wifi_processing_enabled': {True, False},
     'system_processing_enabled': {True, False},
 }
@@ -1048,6 +1055,11 @@ def update_ui_settings(body: dict):
     # Signal receiver to reload only when processing settings actually changed
     if actually_changed_processing:
         signal_receiver()
+    # The syslog exclusion is applied when a query is built, not when a row is
+    # stored, so refreshing the cached setting here is all it takes to have the
+    # switch affect the next request.
+    if 'ui_hide_syslog_traffic' in body:
+        refresh_syslog_filter(enricher_db)
     return {"success": True}
 
 

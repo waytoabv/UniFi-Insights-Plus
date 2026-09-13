@@ -12,6 +12,8 @@ import {
   activeChips,
   chipText,
   clearChips,
+  commitTerm,
+  effectiveSearch,
   joinTerms,
   removeChip,
   splitTerms,
@@ -161,5 +163,55 @@ describe('clearChips', () => {
     const next = clearChips({ src_ip: '10.0.0.1', time_range: '7d', log_type: 'firewall' })
     expect(next.time_range).toBe('7d')
     expect(next.log_type).toBe('firewall')
+  })
+})
+
+
+describe('commitTerm', () => {
+  it('adds the draft to an empty search', () => {
+    expect(commitTerm(null, '443')).toBe('443')
+  })
+
+  it('appends to what is already committed', () => {
+    expect(commitTerm('nas', '443')).toBe('nas 443')
+  })
+
+  it('quotes a phrase', () => {
+    expect(commitTerm('nas', 'allow new')).toBe('nas "allow new"')
+  })
+
+  it('ignores an empty draft', () => {
+    expect(commitTerm('nas', '   ')).toBe('nas')
+    expect(commitTerm(null, '')).toBeNull()
+  })
+
+  it('does not add a term twice', () => {
+    expect(commitTerm('443', '443')).toBe('443')
+  })
+
+  it('keeps distinct terms that share a prefix', () => {
+    expect(commitTerm('10.10.10.1', '10.10.10.10')).toBe('10.10.10.1 10.10.10.10')
+  })
+})
+
+describe('effectiveSearch', () => {
+  it('is the committed terms plus the draft', () => {
+    expect(effectiveSearch('nas', '443')).toBe('nas 443')
+  })
+
+  it('is the draft alone when nothing is committed', () => {
+    expect(effectiveSearch(null, '443')).toBe('443')
+  })
+
+  it('is the committed terms alone when the draft is empty', () => {
+    expect(effectiveSearch('nas', '')).toBe('nas')
+  })
+
+  it('is null when both are empty', () => {
+    expect(effectiveSearch(null, '')).toBeNull()
+  })
+
+  it('does not duplicate a draft that is already committed', () => {
+    expect(effectiveSearch('443', '443')).toBe('443')
   })
 })

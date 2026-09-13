@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react'
 import FilterPanel, { countActive, fromDraft } from './FilterPanel'
-import { activeChips, chipText, clearChips, removeChip } from '../activeFilters'
+import { activeChips, chipText, clearChips, commitTerm, effectiveSearch, removeChip } from '../activeFilters'
 import { fetchServices, fetchInterfaces, fetchProtocols } from '../api'
 import { getInterfaceName, DIRECTION_ICONS, DIRECTION_COLORS, LOG_TYPE_STYLES, ACTION_STYLES, timeRangeToDays, filterVisibleRanges } from '../utils'
 import DateRangePicker from './DateRangePicker'
@@ -34,7 +34,7 @@ const RESET_FILTERS = {
 // Shown as the search box's tooltip. Terms are ANDed, so the box doubles as a
 // way to stack filters without opening the panel.
 const SEARCH_HELP = [
-  'Every term must match. Filters as you type.',
+  'Every term must match. Filters as you type; Enter keeps the term.',
   '',
   '10.10.10.10      that address exactly',
   '10.10.30.0/24    that subnet  (10.10.30.* works too)',
@@ -52,7 +52,12 @@ export default function FilterBar({ filters, onChange, maxFilterDays, prefetched
   const visibleLogTypes = hiddenLogTypes?.size
     ? LOG_TYPES.filter(t => !hiddenLogTypes.has(t))
     : LOG_TYPES
-  const [textSearch, setTextSearch] = useState(filters.search || '')
+  // The box holds the term being typed; committed terms live in filters.search
+  // and are shown as chips. Both apply while typing, so the list narrows before
+  // the term is fixed in place — Enter is what fixes it.
+  const [textSearch, setTextSearch] = useState('')
+  const committedRef = useRef(filters.search || null)
+  committedRef.current = filters.search || null
   const [showPanel, setShowPanel] = useState(false)
   // Option lists for the filter panel's protocol chips and the parent's
   // interface prefetch. The per-field inputs that used to filter these lists
@@ -71,11 +76,11 @@ export default function FilterBar({ filters, onChange, maxFilterDays, prefetched
     isInternalChange.current = true
     onChange(f)
   }, [onChange])
-  // The search box is the only input holding local state now; the panel builds
-  // its own draft when it opens, and the chips read straight from filters.
+  // A search set from outside — a drill-down from the dashboard — arrives as
+  // committed terms, so the box itself stays empty and ready for the next one.
   useEffect(() => {
     if (isInternalChange.current) { isInternalChange.current = false; return }
-    setTextSearch(filters.search || '')
+    setTextSearch('')
   }, [filters.search])
 
   // Load services for autocomplete
@@ -100,25 +105,32 @@ export default function FilterBar({ filters, onChange, maxFilterDays, prefetched
       .catch(err => { console.error('Failed to load interfaces:', err); setInterfaces([]) })
   }, [prefetchedInterfaces])
 
-  const submitSearch = useCallback((value) => {
-    wrappedOnChange({ ...filtersRef.current, search: value || null })
+  /** Fix the typed term in place as a chip and clear the box for the next. */
+  const commitSearch = useCallback(() => {
+    const committed = commitTerm(committedRef.current, textSearch)
+    setTextSearch('')
+    wrappedOnChange({ ...filtersRef.current, search: committed })
+  }, [textSearch]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  /** Drop the typed term without committing it. */
+  const clearDraft = useCallback(() => {
+    setTextSearch('')
+    wrappedOnChange({ ...filtersRef.current, search: committedRef.current })
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Filter as you type. The intermediate states of a structured term are not
   // wrong, just wider — typing 10.10.10.10 passes through 10.1 and 10.10.,
-  // each a real subnet — so the result narrows with each keystroke instead of
-  // waiting for Enter. Short enough to feel immediate, long enough not to
-  // query on every letter.
+  // each a real subnet — so the result narrows with each keystroke. The term is
+  // provisional until Enter: it applies, but it is not yet a chip.
   useEffect(() => {
-    if (textSearch === (filtersRef.current.search || '')) return
-    const t = setTimeout(() => submitSearch(textSearch.trim()), 180)
+    const next = effectiveSearch(committedRef.current, textSearch)
+    if (next === (filtersRef.current.search || null)) return
+    const t = setTimeout(() => {
+      wrappedOnChange({ ...filtersRef.current, search: next })
+    }, 180)
     return () => clearTimeout(t)
-  }, [textSearch, submitSearch])
+  }, [textSearch]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Adopt a search term set from outside, e.g. a drill-down from the dashboard.
-  useEffect(() => {
-    setTextSearch(filters.search || '')
-  }, [filters.search])
 
 
 
@@ -351,20 +363,16 @@ export default function FilterBar({ filters, onChange, maxFilterDays, prefetched
               {chips.map(chip => (
                 <span
                   key={chip.id}
-                  className={`inline-flex items-center gap-1 pl-2 pr-1 py-0.5 rounded border text-[11px] ${
-                    chip.negated
-                      ? 'bg-amber-500/10 border-amber-500/40 text-amber-300'
-                      : 'bg-teal-500/10 border-teal-500/40 text-teal-200'
-                  }`}
+                  className={`filter-chip${chip.negated ? ' is-negated' : ''}`}
                 >
-                  {chip.negated && <span className="opacity-70">not</span>}
-                  {chip.label && <span className="opacity-70">{chip.label}:</span>}
-                  <span className="font-medium truncate max-w-[14rem]">{chip.value}</span>
+                  {chip.negated && <span className="filter-chip-label">not</span>}
+                  {chip.label && <span className="filter-chip-label">{chip.label}:</span>}
+                  <span className="filter-chip-value">{chip.value}</span>
                   <button
                     type="button"
                     onClick={() => wrappedOnChange(removeChip(filtersRef.current, chip))}
                     aria-label={`Remove filter ${chipText(chip)}`}
-                    className="ml-0.5 px-1 rounded text-current opacity-50 hover:opacity-100"
+                    className="filter-chip-remove"
                   >
                     ✕
                   </button>
@@ -389,13 +397,13 @@ export default function FilterBar({ filters, onChange, maxFilterDays, prefetched
           <div className="relative w-full sm:w-72">
             <input
               type="text"
-              placeholder="Filter — IP, port, name…"
+              placeholder="Filter — Enter to keep"
               title={SEARCH_HELP}
               value={textSearch}
               onChange={e => setTextSearch(e.target.value)}
               onKeyDown={e => {
-                if (e.key === 'Enter') { e.preventDefault(); submitSearch(textSearch.trim()) }
-                if (e.key === 'Escape') { setTextSearch(''); submitSearch('') }
+                if (e.key === 'Enter') { e.preventDefault(); commitSearch() }
+                if (e.key === 'Escape') { e.preventDefault(); clearDraft() }
               }}
               className="w-full bg-black border border-gray-700 rounded pl-7 pr-7 py-1.5 text-xs
                          text-gray-300 placeholder-gray-500 focus:outline-none focus:border-teal-500
@@ -405,7 +413,7 @@ export default function FilterBar({ filters, onChange, maxFilterDays, prefetched
             {textSearch && (
               <button
                 type="button"
-                onClick={() => { setTextSearch(''); submitSearch('') }}
+                onClick={clearDraft}
                 aria-label="Clear search"
                 className="absolute right-2 top-1.5 text-gray-500 hover:text-gray-300 text-xs"
               >✕</button>

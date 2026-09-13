@@ -770,3 +770,55 @@ input[type="time"]::-webkit-calendar-picker-indicator {
   scrollbar-width: thin;
   scrollbar-color: #374151 transparent;
 }
+
+/* ── Active filter chips ──────────────────────────────────────────────────── */
+/* Own class rather than Tailwind opacity utilities: those need a per-theme
+   override for every shade, and the light theme needs a genuinely different
+   foreground — a tint that reads on near-black is invisible on white. */
+
+.filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.2rem 0.3rem 0.2rem 0.55rem;
+  border-radius: 0.3rem;
+  border: 1px solid;
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: nowrap;
+
+  background: rgba(45, 212, 191, 0.12);
+  border-color: rgba(45, 212, 191, 0.45);
+  color: #7ff0e0;
+}
+
+.filter-chip-label { opacity: 0.75; }
+.filter-chip-value { font-weight: 500; max-width: 16rem; overflow: hidden; text-overflow: ellipsis; }
+
+.filter-chip-remove {
+  margin-left: 0.1rem;
+  padding: 0 0.25rem;
+  border-radius: 0.2rem;
+  opacity: 0.55;
+  font-size: 11px;
+}
+.filter-chip-remove:hover { opacity: 1; background: rgba(255, 255, 255, 0.1); }
+
+.filter-chip.is-negated {
+  background: rgba(251, 191, 36, 0.12);
+  border-color: rgba(251, 191, 36, 0.45);
+  color: #fcd34d;
+}
+
+[data-theme="light"] .filter-chip {
+  background: #d5f5ef;
+  border-color: #5eccbc;
+  color: #10544c;
+}
+[data-theme="light"] .filter-chip-remove:hover { background: rgba(0, 0, 0, 0.08); }
+
+[data-theme="light"] .filter-chip.is-negated {
+  background: #fdf0d4;
+  border-color: #e0ab3c;
+  color: #6b4708;
+}

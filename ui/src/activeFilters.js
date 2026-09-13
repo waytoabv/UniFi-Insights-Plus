@@ -130,3 +130,26 @@ export function chipText(chip) {
 }
 
 export { FIELD_LABELS }
+
+/**
+ * The query to run while a term is being typed.
+ *
+ * Committed terms are what the chips show; the draft is what is in the box.
+ * Both apply, so the list narrows as you type without the draft having been
+ * committed yet.
+ */
+export function effectiveSearch(committed, draft) {
+  const terms = splitTerms(committed)
+  const typed = (draft ?? '').trim()
+  if (typed && !terms.includes(typed)) terms.push(typed)
+  return terms.length ? joinTerms(terms) : null
+}
+
+/**
+ * Fix the draft in place as its own term, so the box can be used for the next
+ * one. This is what Enter does: the term becomes a chip and stays until it is
+ * removed, rather than being replaced by whatever is typed next.
+ */
+export function commitTerm(committed, draft) {
+  return effectiveSearch(committed, draft)
+}

@@ -34,7 +34,7 @@ export default function SettingsUserInterface({ onSaved }) {
       setSettings(data)
     }).catch(err => {
       console.error('Failed to load UI settings:', err)
-      setSettings({ ui_country_display: 'flag_name', ui_ip_subline: 'none', ui_theme: 'dark', ui_block_highlight: 'on', ui_block_highlight_threshold: 0, ui_csv_export_unifi_raw_log: 'off' })
+      setSettings({ ui_country_display: 'flag_name', ui_ip_subline: 'none', ui_theme: 'dark', ui_block_highlight: 'on', ui_block_highlight_threshold: 0, ui_csv_export_unifi_raw_log: 'off', ui_hide_syslog_traffic: 'off' })
     })
   }, [])
 
@@ -143,6 +143,27 @@ export default function SettingsUserInterface({ onSaved }) {
                 />
               </div>
             )}
+          </div>
+
+          <div className="border-t border-gray-800" />
+
+          {/* Syslog traffic */}
+          <div className="p-5">
+            <p className="text-base text-gray-200 font-medium">Log Traffic</p>
+            <p className="text-sm text-gray-500 mb-3">The gateway's own syslog to this host is firewall traffic like any other.</p>
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={settings.ui_hide_syslog_traffic === 'on'}
+                onChange={e => update('ui_hide_syslog_traffic', e.target.checked ? 'on' : 'off')}
+                className="ui-checkbox"
+              />
+              <span className="text-sm text-gray-300">Hide traffic to this collector on port 514</span>
+            </label>
+            <p className="text-sm text-gray-500 mt-1 ml-6">
+              Removes it from the log stream, Flow view, Threat Map and Dashboard. The entries stay
+              in the database, so this takes effect immediately and nothing is lost by turning it on.
+            </p>
           </div>
 
           <div className="border-t border-gray-800" />

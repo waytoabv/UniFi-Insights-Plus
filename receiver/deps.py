@@ -100,6 +100,7 @@ enricher_db.connect()
 # Filters resolve text to ids through these; bind them before any route runs.
 import query_helpers as _query_helpers
 _query_helpers.set_lookups(enricher_db.lookups)
+_query_helpers.refresh_syslog_filter(enricher_db)
 
 abuseipdb = AbuseIPDBEnricher(db=enricher_db)
 
