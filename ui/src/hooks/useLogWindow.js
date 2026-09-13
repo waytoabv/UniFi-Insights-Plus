@@ -10,7 +10,9 @@ import {
 } from '../logWindow'
 
 const POLL_MS = 5000
-const PAGE_SIZE = 100
+// Large enough that the first screenful and a few scrolls beyond it arrive in
+// one round trip, so the list rarely has to stop and fetch while you read.
+const PAGE_SIZE = 200
 
 /**
  * Cursor-based log window.
@@ -30,7 +32,13 @@ const PAGE_SIZE = 100
  */
 export function useLogWindow(filters, { enabled = true, scrollRef } = {}) {
   const [rows, setRows] = useState([])
+  // Only the very first load blanks the table. A filter change keeps the
+  // previous rows on screen until the new ones arrive: the query answers in
+  // milliseconds, so a skeleton flashing in between reads as a stutter rather
+  // than as progress.
   const [loading, setLoading] = useState(true)
+  const [refreshing, setRefreshing] = useState(false)
+  const hasLoadedRef = useRef(false)
   const [loadingOlder, setLoadingOlder] = useState(false)
   const [hasMore, setHasMore] = useState(false)
   const [pendingCount, setPendingCount] = useState(0)
@@ -57,7 +65,8 @@ export function useLogWindow(filters, { enabled = true, scrollRef } = {}) {
   /** Discard the window and load the newest page. Used on every filter change. */
   const reload = useCallback(async () => {
     const generation = ++generationRef.current
-    setLoading(true)
+    if (hasLoadedRef.current) setRefreshing(true)
+    else setLoading(true)
     setError(null)
     try {
       const result = await query({ before_id: 0, since: 0 })
@@ -66,11 +75,15 @@ export function useLogWindow(filters, { enabled = true, scrollRef } = {}) {
       setHasMore(Boolean(result.has_more))
       setPendingCount(0)
       setLastUpdate(new Date())
+      hasLoadedRef.current = true
     } catch (err) {
       if (generation !== generationRef.current) return
       setError(err)
     } finally {
-      if (generation === generationRef.current) setLoading(false)
+      if (generation === generationRef.current) {
+        setLoading(false)
+        setRefreshing(false)
+      }
     }
   }, [query])
 
@@ -161,6 +174,7 @@ export function useLogWindow(filters, { enabled = true, scrollRef } = {}) {
   return {
     rows,
     loading,
+    refreshing,
     loadingOlder,
     hasMore,
     pendingCount,

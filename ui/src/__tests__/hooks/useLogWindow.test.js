@@ -260,3 +260,42 @@ describe('errors', () => {
     expect(result.current.rows).toHaveLength(3)
   })
 })
+
+
+describe('refreshing keeps the table populated', () => {
+  it('blanks only on the very first load', async () => {
+    fetchLogs.mockResolvedValue(page([3, 2, 1]))
+    const { result } = renderHook(() => useLogWindow({ time_range: '24h' }))
+    expect(result.current.loading).toBe(true)
+    await waitFor(() => expect(result.current.loading).toBe(false))
+  })
+
+  it('a filter change refreshes rather than blanking', async () => {
+    fetchLogs.mockResolvedValue(page([3, 2, 1]))
+    const { result, rerender } = renderHook(
+      ({ f }) => useLogWindow(f),
+      { initialProps: { f: { time_range: '24h' } } }
+    )
+    await waitFor(() => expect(result.current.rows).toHaveLength(3))
+
+    let resolveSecond
+    fetchLogs.mockReturnValueOnce(new Promise((r) => { resolveSecond = r }))
+    rerender({ f: { time_range: '7d' } })
+
+    await waitFor(() => expect(result.current.refreshing).toBe(true))
+    // The old rows are still on screen while the new ones are in flight.
+    expect(result.current.loading).toBe(false)
+    expect(result.current.rows).toHaveLength(3)
+
+    await act(async () => { resolveSecond(page([9])) })
+    await waitFor(() => expect(result.current.refreshing).toBe(false))
+    expect(result.current.rows.map((r) => r.id)).toEqual([9])
+  })
+
+  it('asks for a screenful and then some in one round trip', async () => {
+    fetchLogs.mockResolvedValue(page([1]))
+    renderHook(() => useLogWindow({ time_range: '24h' }))
+    await waitFor(() => expect(fetchLogs).toHaveBeenCalled())
+    expect(fetchLogs.mock.calls[0][0].per_page).toBe(200)
+  })
+})

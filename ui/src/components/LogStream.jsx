@@ -95,7 +95,7 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
   const isRefreshing = autoRefresh && expandedId === null
 
   const {
-    rows, loading, loadingOlder, hasMore, pendingCount, lastUpdate,
+    rows, loading, refreshing, loadingOlder, hasMore, pendingCount, lastUpdate,
     reload, loadOlder, resume, setRows,
   } = useLogWindow(filters, { enabled: isRefreshing, scrollRef })
   const [showScrollTop, setShowScrollTop] = useState(false)
@@ -342,7 +342,12 @@ export default function LogStream({ version, latestRelease, maxFilterDays, drill
 
       {/* Log table */}
       <div className="flex-1 relative overflow-hidden">
-        <div className="h-full overflow-auto" ref={scrollRef}>
+        <div
+          className={`h-full overflow-auto transition-opacity duration-150 ${
+            refreshing ? 'opacity-60' : 'opacity-100'
+          }`}
+          ref={scrollRef}
+        >
           <LogTable logs={rows} loading={loading} expandedId={expandedId} detailedLog={detailedLog} onToggleExpand={handleToggleExpand} hiddenColumns={hiddenColumns} uiSettings={uiSettings} />
         </div>
         {showScrollTop && (

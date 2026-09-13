@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react'
 import FilterPanel, { countActive, fromDraft } from './FilterPanel'
+import { activeChips, chipText, clearChips, removeChip } from '../activeFilters'
 import { fetchServices, fetchInterfaces, fetchProtocols } from '../api'
 import { getInterfaceName, DIRECTION_ICONS, DIRECTION_COLORS, LOG_TYPE_STYLES, ACTION_STYLES, timeRangeToDays, filterVisibleRanges } from '../utils'
 import DateRangePicker from './DateRangePicker'
@@ -33,7 +34,7 @@ const RESET_FILTERS = {
 // Shown as the search box's tooltip. Terms are ANDed, so the box doubles as a
 // way to stack filters without opening the panel.
 const SEARCH_HELP = [
-  'Every term must match. Press Enter to search.',
+  'Every term must match. Filters as you type.',
   '',
   '10.10.10.10      that address exactly',
   '10.10.30.0/24    that subnet  (10.10.30.* works too)',
@@ -51,41 +52,14 @@ export default function FilterBar({ filters, onChange, maxFilterDays, prefetched
   const visibleLogTypes = hiddenLogTypes?.size
     ? LOG_TYPES.filter(t => !hiddenLogTypes.has(t))
     : LOG_TYPES
-  const [ipSearch, setIpSearch] = useState(filters.ip || '')
-  const [ruleSearch, setRuleSearch] = useState(filters.rule_name || '')
   const [textSearch, setTextSearch] = useState(filters.search || '')
   const [showPanel, setShowPanel] = useState(false)
-  const [serviceSearch, setServiceSearch] = useState('')
+  // Option lists for the filter panel's protocol chips and the parent's
+  // interface prefetch. The per-field inputs that used to filter these lists
+  // are gone — the panel and the search box cover the same ground.
   const [services, setServices] = useState([])
-  const [showServiceDropdown, setShowServiceDropdown] = useState(false)
-  const [selectedServices, setSelectedServices] = useState(
-    filters.service ? filters.service.split(',') : []
-  )
-  const [interfaceSearch, setInterfaceSearch] = useState('')
   const [interfaces, setInterfaces] = useState([])
-  const [showInterfaceDropdown, setShowInterfaceDropdown] = useState(false)
-  const [selectedInterfaces, setSelectedInterfaces] = useState(
-    filters.interface ? filters.interface.split(',') : []
-  )
-  const [countrySearch, setCountrySearch] = useState(filters.country || '')
-  const [asnSearch, setAsnSearch] = useState(filters.asn || '')
-  const [dstPortSearch, setDstPortSearch] = useState(filters.dst_port ?? '')
-  const [srcPortSearch, setSrcPortSearch] = useState(filters.src_port ?? '')
-  const [protocolSearch, setProtocolSearch] = useState('')
   const [protocols, setProtocols] = useState([])
-  const [showProtocolDropdown, setShowProtocolDropdown] = useState(false)
-  const [selectedProtocols, setSelectedProtocols] = useState(
-    filters.protocol ? filters.protocol.split(',') : []
-  )
-  const parsePort = (v) => {
-    if (v === '' || v === '!') return null
-    const clean = v.startsWith('!') ? v.slice(1) : v
-    const n = parseInt(clean, 10)
-    if (isNaN(n) || n < 1 || n > 65535) return null
-    // Return as string to preserve '!' prefix for negation
-    return v.startsWith('!') ? `!${n}` : String(n)
-  }
-
   // Ref to avoid stale closures in debounce effects
   const filtersRef = useRef(filters)
   useEffect(() => { filtersRef.current = filters }, [filters])
@@ -133,67 +107,29 @@ export default function FilterBar({ filters, onChange, maxFilterDays, prefetched
       .catch(err => { console.error('Failed to load interfaces:', err); setInterfaces([]) })
   }, [prefetchedInterfaces])
 
-  // Debounce text inputs (skip initial mount to avoid a redundant fetch)
-  const mountedRef = useRef(false)
-
-  useEffect(() => {
-    if (!mountedRef.current) return
-    const t = setTimeout(() => wrappedOnChange({ ...filtersRef.current, ip: ipSearch || null }), 400)
-    return () => clearTimeout(t)
-  }, [ipSearch]) // eslint-disable-line react-hooks/exhaustive-deps
-
-  useEffect(() => {
-    if (!mountedRef.current) return
-    // Normalize: UI displays "] " (space after bracket) for readability but DB stores "]" (no space)
-    const normalized = ruleSearch ? ruleSearch.replace(/\]\s+/g, ']') : null
-    const t = setTimeout(() => wrappedOnChange({ ...filtersRef.current, rule_name: normalized }), 400)
-    return () => clearTimeout(t)
-  }, [ruleSearch]) // eslint-disable-line react-hooks/exhaustive-deps
-
-  // The search box submits on Enter rather than as you type. Its terms are
-  // structured — an address, a port, a field:value pair — and the intermediate
-  // states of typing one are themselves valid queries: "10.10.10.10" passes
-  // through "10.1" and "10.10.", each a different subnet and each a wasted
-  // round trip that briefly shows the wrong rows.
   const submitSearch = useCallback((value) => {
     wrappedOnChange({ ...filtersRef.current, search: value || null })
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Filter as you type. The intermediate states of a structured term are not
+  // wrong, just wider — typing 10.10.10.10 passes through 10.1 and 10.10.,
+  // each a real subnet — so the result narrows with each keystroke instead of
+  // waiting for Enter. Short enough to feel immediate, long enough not to
+  // query on every letter.
+  useEffect(() => {
+    if (textSearch === (filtersRef.current.search || '')) return
+    const t = setTimeout(() => submitSearch(textSearch.trim()), 180)
+    return () => clearTimeout(t)
+  }, [textSearch, submitSearch])
 
   // Adopt a search term set from outside, e.g. a drill-down from the dashboard.
   useEffect(() => {
     setTextSearch(filters.search || '')
   }, [filters.search])
 
-  useEffect(() => {
-    if (!mountedRef.current) return
-    const t = setTimeout(() => wrappedOnChange({ ...filtersRef.current, country: countrySearch || null }), 400)
-    return () => clearTimeout(t)
-  }, [countrySearch]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  useEffect(() => {
-    if (!mountedRef.current) return
-    const t = setTimeout(() => wrappedOnChange({ ...filtersRef.current, asn: asnSearch || null }), 400)
-    return () => clearTimeout(t)
-  }, [asnSearch]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  useEffect(() => {
-    if (!mountedRef.current) return
-    const t = setTimeout(() => {
-      wrappedOnChange({ ...filtersRef.current, dst_port: parsePort(dstPortSearch) })
-    }, 400)
-    return () => clearTimeout(t)
-  }, [dstPortSearch]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  useEffect(() => {
-    if (!mountedRef.current) return
-    const t = setTimeout(() => {
-      wrappedOnChange({ ...filtersRef.current, src_port: parsePort(srcPortSearch) })
-    }, 400)
-    return () => clearTimeout(t)
-  }, [srcPortSearch]) // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Mark mounted AFTER all debounce effects so the guard skips the initial run
-  useEffect(() => { mountedRef.current = true }, [])
 
   // Auto-correct selected range if it exceeds visible ranges (respects ceiling)
   // Skip when in custom date mode (time_range is null, time_from/time_to are set)
@@ -236,6 +172,7 @@ export default function FilterBar({ filters, onChange, maxFilterDays, prefetched
   // Count active (non-default) filters for mobile badge
   // Counts only what the panel itself exposes, so its badge matches its contents.
   const panelFilterCount = countActive(filters)
+  const chips = activeChips(filters)
 
   const activeFilterCount = [
     filters.log_type,              // types narrowed
@@ -243,16 +180,11 @@ export default function FilterBar({ filters, onChange, maxFilterDays, prefetched
     filters.direction,             // directions narrowed
     filters.vpn_only,              // VPN filter active
     (filters.time_from || filters.time_to) || (filters.time_range !== '24h' ? filters.time_range : null),
-    ipSearch,
-    ruleSearch,
-    textSearch,
-    selectedServices.length > 0 ? true : null,
-    selectedInterfaces.length > 0 ? true : null,
-    selectedProtocols.length > 0 ? true : null,
-    countrySearch,
-    asnSearch,
-    dstPortSearch,
-    srcPortSearch,
+    filters.search,
+    filters.ip, filters.src_ip, filters.dst_ip,
+    filters.rule_name, filters.country, filters.asn,
+    filters.dst_port, filters.src_port,
+    filters.service, filters.interface, filters.protocol,
   ].filter(Boolean).length
 
   const toggleAction = (action) => {
@@ -413,333 +345,101 @@ export default function FilterBar({ filters, onChange, maxFilterDays, prefetched
         </div>
       </div>
 
-      {/* Row 2: Text searches */}
-      <div className="flex flex-col sm:flex-row sm:items-center gap-3">
-        <div className="relative">
-          <input
-            type="text"
-            placeholder="IP address..."
-            title="Prefix with ! to exclude matching IPs"
-            value={ipSearch}
-            onChange={e => setIpSearch(e.target.value)}
-            className={`bg-black border rounded px-3 py-1.5 text-xs text-gray-300 placeholder-gray-500 focus:outline-none focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20 w-full sm:w-40 ${ipSearch.startsWith('!') ? 'border-amber-400/60' : 'border-gray-700'}`}
-          />
-          {ipSearch && (
-            <button onClick={() => setIpSearch('')} className="absolute right-2 top-1.5 text-gray-400 hover:text-gray-200 text-xs">✕</button>
-          )}
-        </div>
-        <div className="relative">
-          <input
-            type="text"
-            placeholder="Rule name..."
-            title="Prefix with ! to exclude matching rules"
-            value={ruleSearch}
-            onChange={e => setRuleSearch(e.target.value)}
-            className={`bg-black border rounded px-3 py-1.5 text-xs text-gray-300 placeholder-gray-500 focus:outline-none focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20 w-full sm:w-40 ${ruleSearch.startsWith('!') ? 'border-amber-400/60' : 'border-gray-700'}`}
-          />
-          {ruleSearch && (
-            <button onClick={() => setRuleSearch('')} className="absolute right-2 top-1.5 text-gray-400 hover:text-gray-200 text-xs">✕</button>
-          )}
-        </div>
-        <div className="relative">
-          <input
-            type="text"
-            placeholder={selectedInterfaces.length > 0 ? `${selectedInterfaces.length} interface(s)` : "Interface..."}
-            value={interfaceSearch}
-            onChange={e => {
-              setInterfaceSearch(e.target.value)
-              setShowInterfaceDropdown(true)
-            }}
-            onFocus={() => setShowInterfaceDropdown(true)}
-            onBlur={() => setTimeout(() => setShowInterfaceDropdown(false), 200)}
-            className="bg-black border border-gray-700 rounded px-3 py-1.5 text-xs text-gray-300 placeholder-gray-500 focus:outline-none focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20 w-full sm:w-40"
-          />
-          {selectedInterfaces.length > 0 && (
-            <button
-              onClick={() => {
-                setSelectedInterfaces([])
-                wrappedOnChange({ ...filters, interface: null })
-              }}
-              className="absolute right-2 top-1.5 text-gray-400 hover:text-gray-200 text-xs"
-            >✕</button>
-          )}
-          {showInterfaceDropdown && (
-            <div className="absolute top-full left-0 mt-1 w-64 bg-gray-950 border border-gray-700 rounded shadow-lg max-h-60 overflow-y-auto z-20">
-              {(() => {
-                const q = interfaceSearch.toLowerCase()
-                const filtered = interfaces.filter(iface =>
-                  iface.name.toLowerCase().includes(q) ||
-                  iface.label.toLowerCase().includes(q) ||
-                  (iface.description || '').toLowerCase().includes(q)
-                )
-                return filtered.length === 0
-                  ? <div className="px-3 py-2 text-xs text-gray-400">No matching interfaces</div>
-                  : filtered.slice(0, 50).map(iface => {
-                      const displayName = iface.iface_type === 'vpn' && iface.description
-                        ? iface.description
-                        : (iface.label !== iface.name ? iface.label : (iface.description || iface.name))
-                      return (
-                        <div
-                          key={iface.name}
-                          onClick={() => {
-                            const updated = selectedInterfaces.includes(iface.name)
-                              ? selectedInterfaces.filter(i => i !== iface.name)
-                              : [...selectedInterfaces, iface.name]
-                            setSelectedInterfaces(updated)
-                            wrappedOnChange({ ...filters, interface: updated.length ? updated.join(',') : null })
-                            setInterfaceSearch('')
-                          }}
-                          className={`px-3 py-1.5 cursor-pointer transition-colors ${
-                            selectedInterfaces.includes(iface.name)
-                              ? 'bg-blue-500/20 text-blue-400'
-                              : 'text-gray-300 hover:bg-gray-800'
-                          }`}
-                        >
-                          <div className="flex items-center gap-1.5">
-                            <span className="text-xs truncate">{displayName}</span>
-                            {iface.iface_type === 'wan' && (
-                              <span className="text-[9px] px-1 py-0 rounded bg-blue-500/15 text-blue-400 border border-blue-500/30 shrink-0">WAN</span>
-                            )}
-                            {iface.iface_type === 'vpn' && (
-                              <span className="text-[9px] px-1 py-0 rounded bg-teal-500/15 text-teal-400 border border-teal-500/30 shrink-0">VPN</span>
-                            )}
-                            {iface.iface_type === 'vlan' && iface.vlan_id != null && (
-                              <span className="text-[9px] px-1 py-0 rounded bg-violet-500/15 text-violet-400 border border-violet-500/30 shrink-0">VLAN {iface.vlan_id}</span>
-                            )}
-                          </div>
-                          <span className="text-xs font-mono text-gray-500">{iface.name}</span>
-                        </div>
-                      )
-                    })
-              })()}
-            </div>
-          )}
-        </div>
-        <div className="relative">
-          <input
-            type="text"
-            placeholder="Src port..."
-            title="Prefix with ! to exclude this port"
-            value={srcPortSearch}
-            onChange={e => { const raw = e.target.value; const hasNeg = raw.startsWith('!'); const digits = raw.replace(/[^0-9]/g, ''); setSrcPortSearch(hasNeg ? '!' + digits : digits); }}
-            className={`bg-black border rounded px-3 py-1.5 text-xs text-gray-300 placeholder-gray-500 focus:outline-none focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20 w-full sm:w-24 ${srcPortSearch.startsWith('!') ? 'border-amber-400/60' : 'border-gray-700'}`}
-          />
-          {srcPortSearch && (
-            <button onClick={() => setSrcPortSearch('')} className="absolute right-2 top-1.5 text-gray-400 hover:text-gray-200 text-xs">✕</button>
-          )}
-        </div>
-        <div className="relative">
-          <input
-            type="text"
-            placeholder="Dst port..."
-            title="Prefix with ! to exclude this port"
-            value={dstPortSearch}
-            onChange={e => { const raw = e.target.value; const hasNeg = raw.startsWith('!'); const digits = raw.replace(/[^0-9]/g, ''); setDstPortSearch(hasNeg ? '!' + digits : digits); }}
-            className={`bg-black border rounded px-3 py-1.5 text-xs text-gray-300 placeholder-gray-500 focus:outline-none focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20 w-full sm:w-24 ${dstPortSearch.startsWith('!') ? 'border-amber-400/60' : 'border-gray-700'}`}
-          />
-          {dstPortSearch && (
-            <button onClick={() => setDstPortSearch('')} className="absolute right-2 top-1.5 text-gray-400 hover:text-gray-200 text-xs">✕</button>
-          )}
-        </div>
-        <div className="relative">
-          <input
-            type="text"
-            placeholder={selectedProtocols.length > 0 ? `${selectedProtocols.length} protocol(s)` : "Protocol..."}
-            value={protocolSearch}
-            onChange={e => {
-              setProtocolSearch(e.target.value)
-              setShowProtocolDropdown(true)
-            }}
-            onFocus={() => setShowProtocolDropdown(true)}
-            onBlur={() => setTimeout(() => setShowProtocolDropdown(false), 200)}
-            className="bg-black border border-gray-700 rounded px-3 py-1.5 text-xs text-gray-300 placeholder-gray-500 focus:outline-none focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20 w-full sm:w-32"
-          />
-          {selectedProtocols.length > 0 && (
-            <button
-              onClick={() => {
-                setSelectedProtocols([])
-                wrappedOnChange({ ...filters, protocol: null })
-              }}
-              className="absolute right-2 top-1.5 text-gray-400 hover:text-gray-200 text-xs"
-            >✕</button>
-          )}
-          {showProtocolDropdown && (
-            <div className="absolute top-full left-0 mt-1 w-40 bg-gray-950 border border-gray-700 rounded shadow-lg max-h-60 overflow-y-auto z-20">
-              {protocols
-                .filter(p => p.toLowerCase().includes(protocolSearch.toLowerCase()))
-                .map(protocol => (
-                  <div
-                    key={protocol}
-                    onClick={() => {
-                      const updated = selectedProtocols.includes(protocol)
-                        ? selectedProtocols.filter(p => p !== protocol)
-                        : [...selectedProtocols, protocol]
-                      setSelectedProtocols(updated)
-                      wrappedOnChange({ ...filters, protocol: updated.length ? updated.join(',') : null })
-                      setProtocolSearch('')
-                    }}
-                    className={`px-3 py-2 text-xs cursor-pointer transition-colors ${
-                      selectedProtocols.includes(protocol)
-                        ? 'bg-blue-500/20 text-blue-400'
-                        : 'text-gray-300 hover:bg-gray-800'
-                    }`}
+      {/* Row 2: what is filtering, and the two ways to change it */}
+      <div className="flex flex-col lg:flex-row lg:items-start gap-2">
+        {/* Active filters, whichever way they were set */}
+        <div className="flex-1 min-w-0 flex flex-wrap items-center gap-1.5">
+          {chips.length === 0 ? (
+            <span className="text-[11px] text-gray-600 py-1">No filters</span>
+          ) : (
+            <>
+              {chips.map(chip => (
+                <span
+                  key={chip.id}
+                  className={`inline-flex items-center gap-1 pl-2 pr-1 py-0.5 rounded border text-[11px] ${
+                    chip.negated
+                      ? 'bg-amber-500/10 border-amber-500/40 text-amber-300'
+                      : 'bg-teal-500/10 border-teal-500/40 text-teal-200'
+                  }`}
+                >
+                  {chip.negated && <span className="opacity-70">not</span>}
+                  {chip.label && <span className="opacity-70">{chip.label}:</span>}
+                  <span className="font-medium truncate max-w-[14rem]">{chip.value}</span>
+                  <button
+                    type="button"
+                    onClick={() => wrappedOnChange(removeChip(filtersRef.current, chip))}
+                    aria-label={`Remove filter ${chipText(chip)}`}
+                    className="ml-0.5 px-1 rounded text-current opacity-50 hover:opacity-100"
                   >
-                    {protocol.toUpperCase()}
-                  </div>
-                ))}
-              {protocols.filter(p => p.toLowerCase().includes(protocolSearch.toLowerCase())).length === 0 && (
-                <div className="px-3 py-2 text-xs text-gray-400">No matching protocols</div>
-              )}
-            </div>
+                    ✕
+                  </button>
+                </span>
+              ))}
+              <button
+                type="button"
+                onClick={() => {
+                  setTextSearch('')
+                  wrappedOnChange(clearChips(filtersRef.current))
+                }}
+                className="text-[11px] text-gray-500 hover:text-gray-300 px-1.5 py-0.5"
+              >
+                Clear all
+              </button>
+            </>
           )}
         </div>
-        <div className="relative">
-          <input
-            type="text"
-            placeholder={selectedServices.length > 0 ? `${selectedServices.length} service(s)` : "Service..."}
-            value={serviceSearch}
-            onChange={e => {
-              setServiceSearch(e.target.value)
-              setShowServiceDropdown(true)
-            }}
-            onFocus={() => setShowServiceDropdown(true)}
-            onBlur={() => setTimeout(() => setShowServiceDropdown(false), 200)}
-            className="bg-black border border-gray-700 rounded px-3 py-1.5 text-xs text-gray-300 placeholder-gray-500 focus:outline-none focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20 w-full sm:w-40"
-          />
-          {selectedServices.length > 0 && (
-            <button
-              onClick={() => {
-                setSelectedServices([])
-                wrappedOnChange({ ...filters, service: null })
+
+        {/* Search and the filter panel */}
+        <div className="flex items-center gap-2 shrink-0">
+          <div className="relative w-full sm:w-72">
+            <input
+              type="text"
+              placeholder="Filter — IP, port, name…"
+              title={SEARCH_HELP}
+              value={textSearch}
+              onChange={e => setTextSearch(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Enter') { e.preventDefault(); submitSearch(textSearch.trim()) }
+                if (e.key === 'Escape') { setTextSearch(''); submitSearch('') }
               }}
-              className="absolute right-2 top-1.5 text-gray-400 hover:text-gray-200 text-xs"
-            >✕</button>
-          )}
-          {showServiceDropdown && (
-            <div className="absolute top-full left-0 mt-1 w-56 bg-gray-950 border border-gray-700 rounded shadow-lg max-h-60 overflow-y-auto z-20">
-              {services
-                .filter(s => s.toLowerCase().includes(serviceSearch.toLowerCase()))
-                .slice(0, 50)
-                .map(service => (
-                  <div
-                    key={service}
-                    onClick={() => {
-                      const updated = selectedServices.includes(service)
-                        ? selectedServices.filter(s => s !== service)
-                        : [...selectedServices, service]
-                      setSelectedServices(updated)
-                      wrappedOnChange({ ...filters, service: updated.length ? updated.join(',') : null })
-                      setServiceSearch('')
-                    }}
-                    className={`px-3 py-2 text-xs cursor-pointer transition-colors ${
-                      selectedServices.includes(service)
-                        ? 'bg-blue-500/20 text-blue-400'
-                        : 'text-gray-300 hover:bg-gray-800'
-                    }`}
-                  >
-                    {service}
-                  </div>
-                ))}
-              {services.filter(s => s.toLowerCase().includes(serviceSearch.toLowerCase())).length === 0 && (
-                <div className="px-3 py-2 text-xs text-gray-400">No matching services</div>
-              )}
-            </div>
-          )}
-        </div>
-        <div className="relative">
-          <input
-            type="text"
-            placeholder="Country code..."
-            title="Comma-separated codes (e.g. US,CN). Prefix with ! to exclude all listed countries."
-            value={countrySearch}
-            onChange={e => setCountrySearch(e.target.value)}
-            className={`bg-black border rounded px-3 py-1.5 text-xs text-gray-300 placeholder-gray-500 focus:outline-none focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20 w-full sm:w-28 ${countrySearch.startsWith('!') ? 'border-amber-400/60' : 'border-gray-700'}`}
-          />
-          {countrySearch && (
-            <button onClick={() => setCountrySearch('')} className="absolute right-2 top-1.5 text-gray-400 hover:text-gray-200 text-xs">✕</button>
-          )}
-        </div>
-        <div className="relative">
-          <input
-            type="text"
-            placeholder="ASN..."
-            title="Prefix with ! to exclude matching ASNs"
-            value={asnSearch}
-            onChange={e => setAsnSearch(e.target.value)}
-            className={`bg-black border rounded px-3 py-1.5 text-xs text-gray-300 placeholder-gray-500 focus:outline-none focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20 w-full sm:w-36 ${asnSearch.startsWith('!') ? 'border-amber-400/60' : 'border-gray-700'}`}
-          />
-          {asnSearch && (
-            <button onClick={() => setAsnSearch('')} className="absolute right-2 top-1.5 text-gray-400 hover:text-gray-200 text-xs">✕</button>
-          )}
-        </div>
-        <div className="relative flex-1 sm:max-w-xs">
-          <input
-            type="text"
-            placeholder="Search — press Enter"
-            title={SEARCH_HELP}
-            value={textSearch}
-            onChange={e => setTextSearch(e.target.value)}
-            onKeyDown={e => {
-              if (e.key === 'Enter') { e.preventDefault(); submitSearch(textSearch.trim()) }
-              if (e.key === 'Escape') { setTextSearch(''); submitSearch('') }
-            }}
-            className={`w-full bg-black border rounded px-3 py-1.5 text-xs text-gray-300 placeholder-gray-500 focus:outline-none focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20 ${
-              textSearch !== (filters.search || '') ? 'border-teal-500/60' : 'border-gray-700'
-            }`}
-          />
-          {textSearch && (
-            <button
-              onClick={() => { setTextSearch(''); submitSearch('') }}
-              className="absolute right-2 top-1.5 text-gray-400 hover:text-gray-200 text-xs"
-            >✕</button>
-          )}
-        </div>
-        <div className="relative">
-          <button
-            type="button"
-            onClick={() => setShowPanel(v => !v)}
-            className={`px-3 py-1.5 rounded border text-xs transition-colors whitespace-nowrap ${
-              panelFilterCount > 0
-                ? 'border-teal-500/60 text-teal-300 bg-teal-500/10'
-                : 'border-gray-700 text-gray-400 hover:text-gray-200'
-            }`}
-            aria-expanded={showPanel}
-          >
-            Filters{panelFilterCount > 0 ? ` (${panelFilterCount})` : ''}
-          </button>
-          {showPanel && (
-            <FilterPanel
-              filters={filters}
-              protocols={protocols}
-              onApply={(draft) => wrappedOnChange(fromDraft(filtersRef.current, draft))}
-              onClose={() => setShowPanel(false)}
+              className="w-full bg-black border border-gray-700 rounded pl-7 pr-7 py-1.5 text-xs
+                         text-gray-300 placeholder-gray-500 focus:outline-none focus:border-teal-500
+                         focus:ring-2 focus:ring-teal-500/20"
             />
-          )}
+            <span className="absolute left-2.5 top-1.5 text-gray-600 text-xs">⌕</span>
+            {textSearch && (
+              <button
+                type="button"
+                onClick={() => { setTextSearch(''); submitSearch('') }}
+                aria-label="Clear search"
+                className="absolute right-2 top-1.5 text-gray-500 hover:text-gray-300 text-xs"
+              >✕</button>
+            )}
+          </div>
+
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => setShowPanel(v => !v)}
+              className={`px-3 py-1.5 rounded border text-xs whitespace-nowrap transition-colors ${
+                panelFilterCount > 0
+                  ? 'border-teal-500/60 text-teal-300 bg-teal-500/10'
+                  : 'border-gray-700 text-gray-400 hover:text-gray-200'
+              }`}
+              aria-expanded={showPanel}
+            >
+              Filters{panelFilterCount > 0 ? ` (${panelFilterCount})` : ''}
+            </button>
+            {showPanel && (
+              <FilterPanel
+                filters={filters}
+                protocols={protocols}
+                onApply={(draft) => wrappedOnChange(fromDraft(filtersRef.current, draft))}
+                onClose={() => setShowPanel(false)}
+              />
+            )}
+          </div>
         </div>
-        {activeFilterCount > 0 && (
-          <button
-            type="button"
-            onClick={() => {
-              setIpSearch('')
-              setRuleSearch('')
-              setTextSearch('')
-              setServiceSearch('')
-              setSelectedServices([])
-              setInterfaceSearch('')
-              setSelectedInterfaces([])
-              setCountrySearch('')
-              setAsnSearch('')
-              setDstPortSearch('')
-              setSrcPortSearch('')
-              setProtocolSearch('')
-              setSelectedProtocols([])
-              wrappedOnChange(RESET_FILTERS)
-            }}
-            className="text-xs text-gray-400 hover:text-gray-200 transition-colors"
-          >
-            Reset
-          </button>
-        )}
       </div>
       </div>{/* end collapsible wrapper */}
     </div>
