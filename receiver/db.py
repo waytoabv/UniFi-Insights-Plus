@@ -319,15 +319,9 @@ class Database:
             'label': 'SP-GiST dst_ip for WAN detection',
         },
         {
-            'name': 'idx_logs_type_id',
-            'sql': "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_logs_type_id "
-                   "ON logs (log_type, id)",
-            'label': 'type+id for purge batches',
-        },
-        {
             'name': 'idx_logs_nondns_timestamp',
             'sql': "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_logs_nondns_timestamp "
-                   "ON logs (timestamp DESC) WHERE log_type_id IS DISTINCT FROM the dns id",
+                   f"ON logs (timestamp DESC) WHERE log_type_id IS DISTINCT FROM {_LT_DNS}",
             'label': 'non-DNS retention cleanup',
         },
     ]
@@ -611,11 +605,10 @@ class Database:
                ON CONFLICT (key) DO NOTHING""",
             # Flow aggregation index (Sankey + IP Pairs)
             f"""CREATE INDEX IF NOT EXISTS idx_logs_flow_agg
-                ON logs (timestamp DESC, src_ip, dst_ip, dst_port, protocol)
+                ON logs (timestamp DESC, src_ip, dst_ip, dst_port, protocol_id)
                 WHERE log_type_id = {_LT_FIREWALL} AND src_ip IS NOT NULL AND dst_ip IS NOT NULL""",
-            # Phase 2: Device name columns on logs
-            "ALTER TABLE logs ADD COLUMN IF NOT EXISTS src_device_name TEXT",
-            "ALTER TABLE logs ADD COLUMN IF NOT EXISTS dst_device_name TEXT",
+            # (src_device_name/dst_device_name became src_device_id/dst_device_id,
+            # interned into device_names — see the lookup tables above.)
             "ALTER TABLE logs ADD COLUMN IF NOT EXISTS remote_ip INET",
             # Phase 2: UniFi client cache
             """CREATE TABLE IF NOT EXISTS unifi_clients (
@@ -1510,7 +1503,7 @@ class Database:
                 cur.execute("SELECT COUNT(*) FROM logs")
                 total = cur.fetchone()[0]
                 cur.execute(
-                    "SELECT log_type, COUNT(*) FROM logs "
+                    "SELECT log_type, COUNT(*) FROM logs_text "
                     "WHERE timestamp > NOW() - INTERVAL '1 hour' "
                     "GROUP BY log_type ORDER BY count DESC"
                 )
