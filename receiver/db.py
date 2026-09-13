@@ -19,6 +19,8 @@ import psycopg2.errors
 from psycopg2 import pool, extras
 from psycopg2.extras import Json
 
+import lookups
+
 logger = logging.getLogger(__name__)
 
 
@@ -128,23 +130,26 @@ def wait_for_postgres(conn_params: dict, max_retries: int = 30, delay: float = 2
     sys.exit(1)
 
 
-# Column names matching the logs table
+# Column names matching the logs table.
+#
+# Ordered by alignment — 8-byte types, then 4, then 2, then variable length.
+# PostgreSQL pads each column to its own alignment boundary, so a grown-over-time
+# ordering wastes bytes on every row; at 61 rows/s that is measurable.
 INSERT_COLUMNS = [
-    'timestamp', 'log_type', 'direction',
-    'src_ip', 'src_port', 'dst_ip', 'dst_port', 'protocol', 'service_name',
-    'rule_name', 'rule_desc', 'rule_action',
-    'interface_in', 'interface_out',
-    'mac_address', 'hostname',
-    'dns_query', 'dns_type', 'dns_answer',
-    'dhcp_event', 'wifi_event',
-    'geo_country', 'geo_city', 'geo_lat', 'geo_lon',
-    'asn_number', 'asn_name',
-    'threat_score', 'threat_categories', 'rdns',
-    'abuse_usage_type', 'abuse_hostnames',
-    'abuse_total_reports', 'abuse_last_reported',
+    # 8-byte aligned
+    'timestamp', 'abuse_last_reported',
+    # 4-byte aligned
+    'src_port', 'dst_port', 'asn_number', 'threat_score', 'abuse_total_reports',
+    # 2-byte aligned — the normalised keys
+    'log_type_id', 'direction_id', 'rule_id', 'rule_action_id', 'protocol_id',
+    'iface_in_id', 'iface_out_id', 'hostname_id', 'src_device_id', 'dst_device_id',
+    # 1-byte
     'abuse_is_whitelisted', 'abuse_is_tor',
-    'src_device_name', 'dst_device_name',
-    'remote_ip',
+    # variable length
+    'src_ip', 'dst_ip', 'remote_ip', 'mac_address',
+    'geo_country', 'geo_city', 'geo_lat', 'geo_lon', 'asn_name',
+    'threat_categories', 'rdns', 'abuse_usage_type', 'abuse_hostnames',
+    'dns_query', 'dns_type', 'dns_answer', 'dhcp_event', 'wifi_event',
     'raw_log',
 ]
 
@@ -152,6 +157,77 @@ INSERT_SQL = f"""
     INSERT INTO logs ({', '.join(INSERT_COLUMNS)})
     VALUES ({', '.join(['%s'] * len(INSERT_COLUMNS))})
 """
+
+# Columns copied straight through from the parsed dict, no translation.
+_PASSTHROUGH_COLUMNS = frozenset(INSERT_COLUMNS) - {
+    'log_type_id', 'direction_id', 'rule_id', 'rule_action_id', 'protocol_id',
+    'iface_in_id', 'iface_out_id', 'hostname_id', 'src_device_id', 'dst_device_id',
+    'raw_log',
+}
+
+
+class LogLookups:
+    """The four lookup tables the insert path needs, bound to one Database.
+
+    Held as a unit so callers pass one object instead of four, and so a reload
+    after a config change refreshes all of them together.
+    """
+
+    def __init__(self, db):
+        self.rules = lookups.LookupTable(db, 'rules', ('name', 'descr'))
+        self.interfaces = lookups.LookupTable(db, 'interfaces', ('name',))
+        self.device_names = lookups.LookupTable(db, 'device_names', ('name',))
+        self.protocols = lookups.LookupTable(db, 'protocols', ('name',))
+
+    def reload(self):
+        for table in (self.rules, self.interfaces, self.device_names, self.protocols):
+            table.reload()
+
+
+def should_store_raw(log_type) -> bool:
+    """Whether raw_log is worth keeping for an entry of this type.
+
+    raw_log measured 262 of 473 heap bytes per row — more than half — while
+    holding nothing the parsed columns do not already carry. A one-hour sample
+    of 219,675 rows contained no parse failures at all, so by default it is kept
+    only for lines the parser could not read, where it is the only record of
+    what arrived.
+
+    STORE_RAW_LOG=always restores the old behaviour (and the raw column in CSV
+    exports for every row); never drops it entirely.
+    """
+    mode = os.environ.get('STORE_RAW_LOG', '').strip().lower()
+    if mode == 'always':
+        return True
+    if mode == 'never':
+        return False
+    return str(log_type).strip().lower() == 'unknown'
+
+
+def build_log_row(parsed: dict, lk: LogLookups) -> tuple:
+    """Translate a parsed log dict into the column tuple INSERT_SQL expects.
+
+    Parsers keep emitting text; the mapping to ids happens here. That keeps
+    parsers.py, pihole_api.py and their tests out of the schema change.
+    """
+    log_type = parsed.get('log_type')
+    translated = {
+        'log_type_id': lookups.log_type_id(log_type),
+        'direction_id': lookups.direction_id(parsed.get('direction')),
+        'rule_action_id': lookups.rule_action_id(parsed.get('rule_action')),
+        'rule_id': lk.rules.id_for(parsed.get('rule_name'), parsed.get('rule_desc')),
+        'protocol_id': lk.protocols.id_for(parsed.get('protocol')),
+        'iface_in_id': lk.interfaces.id_for(parsed.get('interface_in')),
+        'iface_out_id': lk.interfaces.id_for(parsed.get('interface_out')),
+        'hostname_id': lk.device_names.id_for(parsed.get('hostname')),
+        'src_device_id': lk.device_names.id_for(parsed.get('src_device_name')),
+        'dst_device_id': lk.device_names.id_for(parsed.get('dst_device_name')),
+        'raw_log': parsed.get('raw_log') if should_store_raw(log_type) else None,
+    }
+    return tuple(
+        parsed.get(col) if col in _PASSTHROUGH_COLUMNS else translated[col]
+        for col in INSERT_COLUMNS
+    )
 
 
 # ── Retention configuration — parsers and result types ───────────────────────
@@ -263,6 +339,58 @@ class Database:
         self.pool = None
         self.min_conn = min_conn
         self.max_conn = max_conn
+        self._lookups = None
+
+    @property
+    def lookups(self) -> 'LogLookups':
+        """Lookup tables for the normalised columns, loaded on first use.
+
+        Built lazily rather than in __init__ because the tables only exist once
+        _ensure_schema has run, and __init__ happens before connect().
+        """
+        if self._lookups is None:
+            self._lookups = LogLookups(self)
+        return self._lookups
+
+    # ── Lookup-table access (used by lookups.LookupTable) ────────────────────
+
+    def fetch_lookup(self, table: str, columns: tuple) -> list[tuple]:
+        """Every row of a lookup table as (id, *values).
+
+        Table and column names are module constants from LogLookups, never user
+        input — they are interpolated because identifiers cannot be bound.
+        """
+        cols = ', '.join(columns)
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT id, {cols} FROM {table} ORDER BY id")
+                return cur.fetchall()
+
+    def insert_lookup(self, table: str, columns: tuple, values: tuple):
+        """Intern a value, returning its id.
+
+        ON CONFLICT DO NOTHING plus a follow-up SELECT rather than a plain
+        INSERT: the receiver and API processes can intern the same new value at
+        the same moment, and the loser of that race still needs the id.
+        """
+        cols = ', '.join(columns)
+        placeholders = ', '.join(['%s'] * len(columns))
+        match = ' AND '.join(
+            f"COALESCE(lower({c}::text), '') = COALESCE(lower(%s::text), '')" for c in columns
+        )
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"INSERT INTO {table} ({cols}) VALUES ({placeholders}) "
+                    f"ON CONFLICT DO NOTHING RETURNING id",
+                    values,
+                )
+                row = cur.fetchone()
+                if row is not None:
+                    return row[0]
+                cur.execute(f"SELECT id FROM {table} WHERE {match}", values)
+                row = cur.fetchone()
+                return row[0] if row else None
 
     def connect(self):
         """Initialize the connection pool."""
@@ -272,6 +400,9 @@ class Database:
         )
         logger.info("PostgreSQL connection pool ready (min=%d, max=%d)", self.min_conn, self.max_conn)
         self._ensure_schema()
+        # Warm the lookup caches now so the first insert does not pay for four
+        # table reads while the UDP receive loop is waiting on it.
+        self._lookups = LogLookups(self)
 
     def _ensure_schema(self):
         """Run idempotent schema migrations (safe on every boot).
@@ -679,6 +810,41 @@ END $$;""",
             )""",
             """CREATE INDEX IF NOT EXISTS idx_rdns_cache_looked_up_at
                 ON rdns_cache (looked_up_at)""",
+            # ── Schema normalisation: lookup tables ───────────────────────
+            # Low-cardinality text is stored once here and referenced by a
+            # SMALLINT from logs. Measured on a live install: rule_name plus
+            # rule_desc alone accounted for 53 of 473 heap bytes per row, at
+            # 41 and 48 distinct values across the whole table.
+            #
+            # These hold values that arrive from the network, so a value never
+            # seen before must not lose data — it gets an id on first sight.
+            # Closed sets produced by our own parsers (log_type, rule_action,
+            # direction) are constants in lookups.py instead.
+            """CREATE TABLE IF NOT EXISTS rules (
+                id     SMALLINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                name   VARCHAR(100),
+                descr  VARCHAR(255)
+            )""",
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_rules_key
+                ON rules (COALESCE(lower(name), ''), COALESCE(lower(descr), ''))""",
+            """CREATE TABLE IF NOT EXISTS interfaces (
+                id     SMALLINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                name   VARCHAR(20) NOT NULL
+            )""",
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_interfaces_key
+                ON interfaces (lower(name))""",
+            """CREATE TABLE IF NOT EXISTS device_names (
+                id     SMALLINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                name   TEXT NOT NULL
+            )""",
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_device_names_key
+                ON device_names (lower(name))""",
+            """CREATE TABLE IF NOT EXISTS protocols (
+                id     SMALLINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                name   VARCHAR(10) NOT NULL
+            )""",
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_protocols_key
+                ON protocols (lower(name))""",
         ]
         try:
             with self.get_conn() as conn:
@@ -972,7 +1138,7 @@ END $$;""",
 
     def insert_log(self, parsed: dict):
         """Insert a single parsed log entry."""
-        values = tuple(parsed.get(col) for col in INSERT_COLUMNS)
+        values = build_log_row(parsed, self.lookups)
 
         with self.get_conn() as conn:
             with conn.cursor() as cur:
@@ -985,7 +1151,7 @@ END $$;""",
         transaction boundary.  Used by both syslog (with fallback) and Pi-hole
         (strict, no fallback) insert paths.
         """
-        rows = [tuple(log.get(col) for col in INSERT_COLUMNS) for log in logs]
+        rows = [build_log_row(log, self.lookups) for log in logs]
         cur.execute("SET LOCAL statement_timeout = '30s'")
         extras.execute_batch(cur, INSERT_SQL, rows, page_size=100)
         return len(rows)
@@ -1010,7 +1176,7 @@ END $$;""",
                           batch_err, len(logs))
             inserted = 0
             dropped = 0
-            rows = [tuple(log.get(col) for col in INSERT_COLUMNS) for log in logs]
+            rows = [build_log_row(log, self.lookups) for log in logs]
             for row in rows:
                 try:
                     with self.get_conn() as conn:
