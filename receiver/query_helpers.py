@@ -211,35 +211,13 @@ def build_log_query(
     conditions.extend(time_conds)
     params.extend(time_params)
 
-    if src_ip:
-        negated, val = _parse_negation(src_ip)
-        op = "NOT LIKE" if negated else "LIKE"
-        if negated:
-            conditions.append(f"(src_ip::text {op} %s ESCAPE '\\' OR src_ip IS NULL)")
-        else:
-            conditions.append(f"src_ip::text {op} %s ESCAPE '\\'") 
-        params.append(f"%{_escape_like(val)}%")
-
-    if dst_ip:
-        negated, val = _parse_negation(dst_ip)
-        op = "NOT LIKE" if negated else "LIKE"
-        if negated:
-            conditions.append(f"(dst_ip::text {op} %s ESCAPE '\\' OR dst_ip IS NULL)")
-        else:
-            conditions.append(f"dst_ip::text {op} %s ESCAPE '\\'") 
-        params.append(f"%{_escape_like(val)}%")
-
-    if ip:
-        negated, val = _parse_negation(ip)
-        escaped_ip = _escape_like(val)
-        if negated:
-            conditions.append(
-                "((src_ip::text NOT LIKE %s ESCAPE '\\' OR src_ip IS NULL)"
-                " AND (dst_ip::text NOT LIKE %s ESCAPE '\\' OR dst_ip IS NULL))"
-            )
-        else:
-            conditions.append("(src_ip::text LIKE %s ESCAPE '\\' OR dst_ip::text LIKE %s ESCAPE '\\')")
-        params.extend([f"%{escaped_ip}%", f"%{escaped_ip}%"])
+    for value, columns in ((src_ip, ('src_ip',)),
+                           (dst_ip, ('dst_ip',)),
+                           (ip, ('src_ip', 'dst_ip'))):
+        if value:
+            sql, bound = _address_filter(value, columns)
+            conditions.append(sql)
+            params.extend(bound)
 
     if direction:
         directions = [d.strip() for d in direction.split(',')]
@@ -434,6 +412,36 @@ _SCOPE_COLUMNS = {
     'dst_port': ('dst_port',),
     'port': ('src_port', 'dst_port'),
 }
+
+
+def _address_filter(value: str, columns: tuple) -> tuple[str, list]:
+    """Build the condition for one of the dedicated address filters.
+
+    The value is classified the same way a search term is, so an address is
+    compared as an address: 10.10.10.10 no longer matches 10.10.10.100, and the
+    inet index applies. Anything that is not an address — a hostname, a partial
+    word — still falls back to a text match, since the field accepts those too.
+    """
+    negated, raw = _parse_negation(value)
+    terms = parse_search(raw)
+    term = terms[0] if terms else None
+
+    if term is not None and term.kind in ('ip', 'cidr'):
+        operator = '=' if term.kind == 'ip' else '<<='
+        parts = [f"{c} {operator} %s" for c in columns]
+        params = [term.value] * len(columns)
+        clause = f"({' OR '.join(parts)})"
+    else:
+        pattern = f"%{_escape_like(raw)}%"
+        parts = [f"{c}::text ILIKE %s ESCAPE '\\'" for c in columns]
+        params = [pattern] * len(columns)
+        clause = f"({' OR '.join(parts)})"
+
+    if negated:
+        # A row with no address in these columns was not excluded by the user,
+        # and `NOT (col = x)` is NULL rather than true when col is NULL.
+        return (f"NOT COALESCE({clause}, FALSE)", params)
+    return (clause, params)
 
 
 def _address_condition(term) -> tuple[str, list]:

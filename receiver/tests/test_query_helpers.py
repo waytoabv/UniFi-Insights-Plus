@@ -205,11 +205,20 @@ class TestBuildLogQuery:
 
     def test_negated_ip(self):
         where, params = self._build(ip='!1.2.3.4')
-        assert 'NOT LIKE' in where
+        assert 'NOT COALESCE(' in where
+        assert '1.2.3.4' in params
 
     def test_src_ip_filter(self):
+        """Superseded text matching: an address is compared as an address, so
+        10.0.0.1 no longer also returns 10.0.0.10."""
         where, params = self._build(src_ip='10.0.0.1')
-        assert 'src_ip::text LIKE' in where
+        assert 'src_ip = %s' in where
+        assert '10.0.0.1' in params
+
+    def test_partial_ip_input_still_matches_as_text(self):
+        """The field accepts hostnames and half-typed values too."""
+        where, _ = self._build(src_ip='nas')
+        assert 'ILIKE' in where
 
     def test_negated_rule_action(self):
         where, params = self._build(rule_action='!block')

@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react'
+import FilterPanel, { countActive, fromDraft } from './FilterPanel'
 import { fetchServices, fetchInterfaces, fetchProtocols } from '../api'
 import { getInterfaceName, DIRECTION_ICONS, DIRECTION_COLORS, LOG_TYPE_STYLES, ACTION_STYLES, timeRangeToDays, filterVisibleRanges } from '../utils'
 import DateRangePicker from './DateRangePicker'
@@ -53,6 +54,7 @@ export default function FilterBar({ filters, onChange, maxFilterDays, prefetched
   const [ipSearch, setIpSearch] = useState(filters.ip || '')
   const [ruleSearch, setRuleSearch] = useState(filters.rule_name || '')
   const [textSearch, setTextSearch] = useState(filters.search || '')
+  const [showPanel, setShowPanel] = useState(false)
   const [serviceSearch, setServiceSearch] = useState('')
   const [services, setServices] = useState([])
   const [showServiceDropdown, setShowServiceDropdown] = useState(false)
@@ -232,6 +234,9 @@ export default function FilterBar({ filters, onChange, maxFilterDays, prefetched
   const visibleRanges = filterVisibleRanges(TIME_RANGES, maxFilterDays, tr => tr.value)
 
   // Count active (non-default) filters for mobile badge
+  // Counts only what the panel itself exposes, so its badge matches its contents.
+  const panelFilterCount = countActive(filters)
+
   const activeFilterCount = [
     filters.log_type,              // types narrowed
     filters.rule_action,           // actions narrowed
@@ -687,6 +692,28 @@ export default function FilterBar({ filters, onChange, maxFilterDays, prefetched
               onClick={() => { setTextSearch(''); submitSearch('') }}
               className="absolute right-2 top-1.5 text-gray-400 hover:text-gray-200 text-xs"
             >✕</button>
+          )}
+        </div>
+        <div className="relative">
+          <button
+            type="button"
+            onClick={() => setShowPanel(v => !v)}
+            className={`px-3 py-1.5 rounded border text-xs transition-colors whitespace-nowrap ${
+              panelFilterCount > 0
+                ? 'border-teal-500/60 text-teal-300 bg-teal-500/10'
+                : 'border-gray-700 text-gray-400 hover:text-gray-200'
+            }`}
+            aria-expanded={showPanel}
+          >
+            Filters{panelFilterCount > 0 ? ` (${panelFilterCount})` : ''}
+          </button>
+          {showPanel && (
+            <FilterPanel
+              filters={filters}
+              protocols={protocols}
+              onApply={(draft) => wrappedOnChange(fromDraft(filtersRef.current, draft))}
+              onClose={() => setShowPanel(false)}
+            />
           )}
         </div>
         {activeFilterCount > 0 && (
