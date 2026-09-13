@@ -324,6 +324,25 @@ def main():
     logger.info("Swapping tables...")
     cur.execute("ALTER TABLE logs RENAME TO logs_old")
     cur.execute("ALTER TABLE logs_new RENAME TO logs")
+
+    # Renaming a table does not rename its indexes: logs_old still holds
+    # idx_logs_timestamp, idx_logs_action_time and the rest. Index names are
+    # unique per schema, so every CREATE INDEX IF NOT EXISTS below would find
+    # the name taken and silently do nothing — leaving the new table with only
+    # its primary key, and every filtered query on a sequential scan.
+    cur.execute("""
+        DO $$
+        DECLARE r record;
+        BEGIN
+            FOR r IN SELECT indexname FROM pg_indexes
+                     WHERE tablename = 'logs_old' AND indexname NOT LIKE '%_old'
+            LOOP
+                EXECUTE format('ALTER INDEX %I RENAME TO %I',
+                               r.indexname, left(r.indexname, 55) || '_old');
+            END LOOP;
+        END $$
+    """)
+    cur.execute("ALTER INDEX IF EXISTS logs_new_pkey RENAME TO logs_pkey")
     # logs_new was created with a plain BIGINT id so the copy could carry the
     # original ids; the sequence is attached here and set past the high-water mark.
     cur.execute("CREATE SEQUENCE IF NOT EXISTS logs_id_seq OWNED BY logs.id")
@@ -339,6 +358,22 @@ def main():
 
     cur.execute("ANALYZE logs")
     conn.commit()
+
+    # Verify rather than assume: a CREATE INDEX that silently did nothing is
+    # invisible until a query runs slowly weeks later.
+    expected = {sql.split('idx_')[1].split()[0] for sql in POST_COPY_INDEXES}
+    expected = {'idx_' + n for n in expected}
+    cur.execute("SELECT indexname FROM pg_indexes WHERE tablename = 'logs'")
+    present = {row[0] for row in cur.fetchall()}
+    missing = expected - present
+    if missing:
+        logger.error("These indexes were not created on the new table: %s",
+                     ', '.join(sorted(missing)))
+        logger.error("Queries will fall back to sequential scans. Create them by hand "
+                     "before considering the migration finished.")
+        return 1
+    cur.execute("""SELECT pg_size_pretty(pg_indexes_size('logs'))""")
+    logger.info("Indexes on logs: %d, %s", len(present), cur.fetchone()[0])
 
     logger.info("Done. The previous table is kept as logs_old (%s).", table_size(cur, 'logs_old'))
     logger.info("Start the services, check the dashboard, then drop it:")

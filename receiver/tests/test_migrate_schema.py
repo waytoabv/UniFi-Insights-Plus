@@ -5,6 +5,7 @@ column sets have to agree. A mismatch would only surface as a crash after the
 swap, with the old table already renamed.
 """
 
+import inspect
 import re
 
 import lookups
@@ -77,3 +78,36 @@ class TestSeeds:
     def test_seeds_are_idempotent(self):
         for sql, _ in m.SEED_LOOKUPS:
             assert 'ON CONFLICT DO NOTHING' in sql
+
+
+class TestIndexNameCollision:
+    """Renaming a table leaves its indexes under their original names.
+
+    The first run of this migration swapped logs → logs_old, then issued
+    CREATE INDEX IF NOT EXISTS for each index on the new table. Every one of
+    those names was still held by an index on logs_old, so all eight did
+    nothing and the new table was left with only its primary key — every
+    filtered query fell back to a sequential scan.
+    """
+
+    def test_old_indexes_are_renamed_before_new_ones_are_created(self):
+        source = inspect.getsource(m.main)
+        rename_at = source.index("ALTER INDEX %I RENAME TO %I")
+        create_at = source.index("for sql in POST_COPY_INDEXES")
+        assert rename_at < create_at, \
+            "old index names must be freed before the new indexes are created"
+
+    def test_rename_skips_already_renamed_indexes(self):
+        """The step has to be idempotent — the migration is restartable."""
+        source = inspect.getsource(m.main)
+        assert "indexname NOT LIKE '%_old'" in source
+
+    def test_rename_stays_within_the_identifier_limit(self):
+        """Appending a suffix to a 63-character identifier would truncate it
+        into a collision with another renamed index."""
+        source = inspect.getsource(m.main)
+        assert "left(r.indexname, 55)" in source
+
+    def test_result_is_verified_not_assumed(self):
+        source = inspect.getsource(m.main)
+        assert "were not created on the new table" in source
