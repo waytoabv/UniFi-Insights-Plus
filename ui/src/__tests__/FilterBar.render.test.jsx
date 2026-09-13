@@ -8,6 +8,7 @@
  * component.
  */
 
+import React from 'react'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 
@@ -203,5 +204,79 @@ describe('filter panel', () => {
     expect(onChange).toHaveBeenCalledWith(
       expect.objectContaining({ dst_port: '!443' })
     )
+  })
+})
+
+
+describe('typing a term does not accumulate its own intermediate states', () => {
+  /**
+   * Typing 10.10.10.0/24 produced five chips — 10.10.10., 10.10.10.1,
+   * 10.10.10.0, 10.10.10.0/ and finally 10.10.10.0/24 — because each debounce
+   * tick wrote the draft into filters.search, and the next render read that
+   * back as a term that had already been kept.
+   */
+  function TypeHarness({ onFilters }) {
+    const [filters, setFilters] = React.useState(BASE)
+    React.useEffect(() => { onFilters(filters) }, [filters, onFilters])
+    return <FilterBar filters={filters} onChange={setFilters} />
+  }
+
+  it('leaves one term after typing an address in steps', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    let latest = BASE
+    render(<TypeHarness onFilters={(f) => { latest = f }} />)
+    const box = screen.getByPlaceholderText(/Filter —/)
+
+    for (const step of ['10.10.10.', '10.10.10.0', '10.10.10.0/', '10.10.10.0/24']) {
+      fireEvent.change(box, { target: { value: step } })
+      await vi.advanceTimersByTimeAsync(200)
+    }
+
+    expect(latest.search).toBe('10.10.10.0/24')
+    vi.useRealTimers()
+  })
+
+  it('shows no chip until the term is kept', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    render(<TypeHarness onFilters={() => {}} />)
+    const box = screen.getByPlaceholderText(/Filter —/)
+
+    fireEvent.change(box, { target: { value: '10.10.10.0/24' } })
+    await vi.advanceTimersByTimeAsync(200)
+
+    // The draft is visible in the box; a chip would be a second copy of it.
+    expect(screen.queryByLabelText(/Remove filter/)).not.toBeInTheDocument()
+    vi.useRealTimers()
+  })
+
+  it('Enter turns the draft into exactly one chip', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    render(<TypeHarness onFilters={() => {}} />)
+    const box = screen.getByPlaceholderText(/Filter —/)
+
+    fireEvent.change(box, { target: { value: '10.10.10.0/24' } })
+    await vi.advanceTimersByTimeAsync(200)
+    fireEvent.keyDown(box, { key: 'Enter' })
+
+    expect(screen.getAllByLabelText(/Remove filter/)).toHaveLength(1)
+    vi.useRealTimers()
+  })
+
+  it('a second term is added beside the first, not merged into it', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    let latest = BASE
+    render(<TypeHarness onFilters={(f) => { latest = f }} />)
+    const box = screen.getByPlaceholderText(/Filter —/)
+
+    fireEvent.change(box, { target: { value: '10.10.10.0/24' } })
+    fireEvent.keyDown(box, { key: 'Enter' })
+    for (const step of ['4', '44', '443']) {
+      fireEvent.change(box, { target: { value: step } })
+      await vi.advanceTimersByTimeAsync(200)
+    }
+    fireEvent.keyDown(box, { key: 'Enter' })
+
+    expect(latest.search).toBe('10.10.10.0/24 443')
+    vi.useRealTimers()
   })
 })

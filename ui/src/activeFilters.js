@@ -70,8 +70,14 @@ export function joinTerms(terms) {
  * Each carries enough to remove itself: which filter it came from, and for a
  * search term, its position in the query.
  */
-export function activeChips(filters) {
+export function activeChips(filters, search = undefined) {
   const chips = []
+  // `search` is passed explicitly by the filter bar, which holds the kept terms
+  // separately from the one being typed. Reading filters.search instead would
+  // show the draft as a chip, and — because the bar writes the draft there for
+  // the live preview — treat each keystroke's intermediate value as a term of
+  // its own on the next render.
+  const searchValue = search === undefined ? filters.search : search
 
   for (const { key, label } of CHIP_FIELDS) {
     const raw = filters[key]
@@ -89,7 +95,7 @@ export function activeChips(filters) {
     })
   }
 
-  splitTerms(filters.search).forEach((term, index) => {
+  splitTerms(searchValue).forEach((term, index) => {
     const negated = term.startsWith('!') || term.startsWith('-')
     chips.push({
       id: `search:${index}`,
@@ -107,11 +113,11 @@ export function activeChips(filters) {
 }
 
 /** Remove one chip, returning the filters without it. */
-export function removeChip(filters, chip) {
+export function removeChip(filters, chip, search = undefined) {
   if (chip.source === 'field') {
     return { ...filters, [chip.field]: null }
   }
-  const terms = splitTerms(filters.search)
+  const terms = splitTerms(search === undefined ? filters.search : search)
   terms.splice(chip.index, 1)
   return { ...filters, search: terms.length ? joinTerms(terms) : null }
 }

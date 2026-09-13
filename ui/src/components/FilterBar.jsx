@@ -52,12 +52,14 @@ export default function FilterBar({ filters, onChange, maxFilterDays, prefetched
   const visibleLogTypes = hiddenLogTypes?.size
     ? LOG_TYPES.filter(t => !hiddenLogTypes.has(t))
     : LOG_TYPES
-  // The box holds the term being typed; committed terms live in filters.search
-  // and are shown as chips. Both apply while typing, so the list narrows before
-  // the term is fixed in place — Enter is what fixes it.
+  // Kept terms and the one being typed are tracked apart. They cannot both live
+  // in filters.search: the bar writes the draft there for the live preview, so
+  // reading them back from it turned every keystroke's intermediate value into
+  // a term of its own — typing 10.10.10.0/24 left five.
+  const [committed, setCommitted] = useState(filters.search || null)
   const [textSearch, setTextSearch] = useState('')
-  const committedRef = useRef(filters.search || null)
-  committedRef.current = filters.search || null
+  const committedRef = useRef(committed)
+  committedRef.current = committed
   const [showPanel, setShowPanel] = useState(false)
   // Option lists for the filter panel's protocol chips and the parent's
   // interface prefetch. The per-field inputs that used to filter these lists
@@ -77,9 +79,10 @@ export default function FilterBar({ filters, onChange, maxFilterDays, prefetched
     onChange(f)
   }, [onChange])
   // A search set from outside — a drill-down from the dashboard — arrives as
-  // committed terms, so the box itself stays empty and ready for the next one.
+  // kept terms, so the box itself stays empty and ready for the next one.
   useEffect(() => {
     if (isInternalChange.current) { isInternalChange.current = false; return }
+    setCommitted(filters.search || null)
     setTextSearch('')
   }, [filters.search])
 
@@ -107,16 +110,25 @@ export default function FilterBar({ filters, onChange, maxFilterDays, prefetched
 
   /** Fix the typed term in place as a chip and clear the box for the next. */
   const commitSearch = useCallback(() => {
-    const committed = commitTerm(committedRef.current, textSearch)
+    const next = commitTerm(committedRef.current, textSearch)
+    setCommitted(next)
     setTextSearch('')
-    wrappedOnChange({ ...filtersRef.current, search: committed })
+    wrappedOnChange({ ...filtersRef.current, search: next })
   }, [textSearch]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  /** Drop the typed term without committing it. */
+  /** Drop the typed term without keeping it. */
   const clearDraft = useCallback(() => {
     setTextSearch('')
     wrappedOnChange({ ...filtersRef.current, search: committedRef.current })
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  /** Remove a chip — a panel field, or one of the kept search terms. */
+  const dropChip = useCallback((chip) => {
+    const next = removeChip(filtersRef.current, chip, committedRef.current)
+    if (chip.source === 'search') setCommitted(next.search)
+    // The draft still applies on top of what is left.
+    wrappedOnChange({ ...next, search: effectiveSearch(next.search, textSearch) })
+  }, [textSearch]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Filter as you type. The intermediate states of a structured term are not
   // wrong, just wider — typing 10.10.10.10 passes through 10.1 and 10.10.,
@@ -177,7 +189,7 @@ export default function FilterBar({ filters, onChange, maxFilterDays, prefetched
   // Count active (non-default) filters for mobile badge
   // Counts only what the panel itself exposes, so its badge matches its contents.
   const panelFilterCount = countActive(filters)
-  const chips = activeChips(filters)
+  const chips = activeChips(filters, committed)
 
   const activeFilterCount = [
     filters.log_type,              // types narrowed
@@ -370,7 +382,7 @@ export default function FilterBar({ filters, onChange, maxFilterDays, prefetched
                   <span className="filter-chip-value">{chip.value}</span>
                   <button
                     type="button"
-                    onClick={() => wrappedOnChange(removeChip(filtersRef.current, chip))}
+                    onClick={() => dropChip(chip)}
                     aria-label={`Remove filter ${chipText(chip)}`}
                     className="filter-chip-remove"
                   >
@@ -381,6 +393,7 @@ export default function FilterBar({ filters, onChange, maxFilterDays, prefetched
               <button
                 type="button"
                 onClick={() => {
+                  setCommitted(null)
                   setTextSearch('')
                   wrappedOnChange(clearChips(filtersRef.current))
                 }}
